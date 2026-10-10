@@ -9,6 +9,10 @@ works on, so ``emerge_aura`` only depends on numpy. EMerge's
 * :func:`mesh_to_aura_inputs` Extract the arrays AURA needs from a ``Mesh3D``.
 * :func:`refine_mesh3d`       Build a new ``Mesh3D`` from a :class:`RefineResult`.
 * :func:`growth_for_pass`     Resolve the per-pass growth setting (fixed, list, "auto", callable).
+* :func:`periodic_node_pairs` Pair the nodes of periodic faces.
+
+Periodic boundaries are described as a list of ``(face1_tags, face2_tags, dv)``
+with face2 = face1 + dv, as in EMerge's ``Periodic`` boundary conditions.
 """
 
 from __future__ import annotations
@@ -144,8 +148,8 @@ def build_topology(mesh: Any, nodes: np.ndarray, tets: np.ndarray) -> None:
 # -----------------------------------------------------------------------------
 
 
-def mesh_to_aura_inputs(mesh: Any) -> dict[str, np.ndarray]:
-    """Extract nodes, tets, tagged face triangles and tagged curve edges from a Mesh3D."""
+def mesh_to_aura_inputs(mesh: Any, periodic: Periodic | None = None) -> dict[str, np.ndarray]:
+    """Extract nodes, tets, regions, tagged faces/curves and periodic node pairs from a Mesh3D."""
     face_tris, face_tags = [], []
     for tag, tri_ids in mesh.ftag_to_tri.items():
         ids = np.asarray([i for i in tri_ids if i is not None], dtype=np.int64)
@@ -172,6 +176,7 @@ def mesh_to_aura_inputs(mesh: Any) -> dict[str, np.ndarray]:
         face_tri_tags=cat(face_tags, (0,), np.int32),
         curve_edges=cat(curve_edges, (0, 2), np.int64),
         curve_edge_tags=cat(curve_tags, (0,), np.int32),
+        periodic_pairs=periodic_node_pairs(mesh, periodic) if periodic else np.zeros((0, 3), dtype=np.int64),
     )
 
 
@@ -249,6 +254,84 @@ def refine_mesh3d(mesh: Any, result: RefineResult) -> Any:
 # Growth control
 # -----------------------------------------------------------------------------
 
+Periodic = Sequence[tuple[Sequence[int], Sequence[int], np.ndarray]]
+
+
+def _match_points(src: np.ndarray, dst: np.ndarray, tol: float) -> np.ndarray:
+    """For each row of ``src`` the index of the row of ``dst`` within ``tol`` (or -1)."""
+    cell = 4 * tol
+    keys = np.floor(dst / cell).astype(np.int64)
+    grid: dict[tuple[int, int, int], list[int]] = {}
+    for j, k in enumerate(map(tuple, keys.tolist())):
+        grid.setdefault(k, []).append(j)
+    out = np.full(len(src), -1, dtype=np.int64)
+    offsets = [(i, j, k) for i in (-1, 0, 1) for j in (-1, 0, 1) for k in (-1, 0, 1)]
+    for i, (p, k) in enumerate(zip(src, np.floor(src / cell).astype(np.int64).tolist())):
+        best, bd = -1, tol * tol
+        for o in offsets:
+            for j in grid.get((k[0] + o[0], k[1] + o[1], k[2] + o[2]), ()):
+                d = float(np.sum((dst[j] - p) ** 2))
+                if d <= bd:
+                    best, bd = j, d
+        out[i] = best
+    return out
+
+
+def _face_nodes(mesh: Any, tags: Sequence[int]) -> np.ndarray:
+    tris = [i for t in tags for i in mesh.ftag_to_tri[t]]
+    return np.unique(mesh.tris[:, np.asarray(tris, dtype=np.int64)])
+
+
+def periodic_node_pairs(mesh: Any, periodic: Periodic, rel_tol: float = 1e-9) -> np.ndarray:
+    """Pair the nodes of every periodic face pair.
+
+    Returns:
+        (P, 3) int64 rows ``(k, source_node, target_node)`` for periodic boundary ``k``.
+    """
+    tol = rel_tol * float(np.linalg.norm(np.ptp(mesh.nodes, axis=1)))
+    rows = []
+    for k, (tags1, tags2, dv) in enumerate(periodic):
+        n1, n2 = _face_nodes(mesh, tags1), _face_nodes(mesh, tags2)
+        idx = _match_points(mesh.nodes[:, n1].T + np.asarray(dv, dtype=np.float64), mesh.nodes[:, n2].T, tol)
+        if len(n1) != len(n2) or np.any(idx < 0) or len(np.unique(idx)) != len(idx):
+            raise ValueError(
+                f"Periodic boundary {k}: faces {list(tags1)} and {list(tags2)} do not have matching meshes "
+                f"({len(n1)} vs {len(n2)} nodes, {int(np.sum(idx < 0))} unmatched)."
+            )
+        rows.append(np.stack([np.full(len(n1), k), n1, n2[idx]], axis=1))
+    return np.concatenate(rows).astype(np.int64) if rows else np.zeros((0, 3), dtype=np.int64)
+
+
+def periodic_report(mesh: Any, periodic: Periodic) -> list[dict]:
+    """Check periodic faces: matching triangles and an order preserving node map.
+
+    Returns one dict per boundary with the triangle counts, the largest distance
+    between a source triangle centre + dv and its partner, and whether the node map
+    is order preserving (needed for consistent edge orientations in EMerge).
+    """
+    out = []
+    pairs = periodic_node_pairs(mesh, periodic)
+    for k, (tags1, tags2, dv) in enumerate(periodic):
+        t1 = np.asarray([i for t in tags1 for i in mesh.ftag_to_tri[t]], dtype=np.int64)
+        t2 = np.asarray([i for t in tags2 for i in mesh.ftag_to_tri[t]], dtype=np.int64)
+        c1 = mesh.tri_centers[:, t1].T + np.asarray(dv)
+        c2 = mesh.tri_centers[:, t2].T
+        tol = 1e-9 * float(np.linalg.norm(np.ptp(mesh.nodes, axis=1)))
+        idx = _match_points(c1, c2, tol)
+        dist = np.linalg.norm(c1 - c2[idx], axis=1) if np.all(idx >= 0) else np.array([np.inf])
+        p = pairs[pairs[:, 0] == k]
+        order = np.argsort(p[:, 1])
+        out.append(
+            dict(
+                n_tris=(len(t1), len(t2)),
+                unmatched=int(np.sum(idx < 0)),
+                max_center_distance=float(dist.max()) if dist.size else 0.0,
+                order_preserving=bool(np.all(np.diff(p[order, 2]) > 0)),
+            )
+        )
+    return out
+
+
 GrowthSpec = Union[float, str, Sequence[float], Callable[[int, dict], float]]
 
 
@@ -317,6 +400,7 @@ def refine_mesh_step(
     lepp_ratio: float = 0.7,
     improve_sweeps: int = 3,
     improve_layers: int = 2,
+    periodic: Periodic | None = None,
 ) -> tuple[Any, dict]:
     """Refine an EMerge ``Mesh3D`` once and return the new mesh plus a report.
 
@@ -326,12 +410,13 @@ def refine_mesh_step(
         brep: Geometry snapshot for projecting new boundary nodes.
         growth: Relative increase of the number of tets (0.3 = +30 %).
         order, max_depth, lepp_ratio, improve_sweeps, improve_layers: See :func:`emerge_aura.refine`.
+        periodic: Periodic boundaries as ``[(face1_tags, face2_tags, dv), ...]``.
 
     Returns:
         (new_mesh, report): the refined ``Mesh3D`` and a dict with ``n_tets_before``,
         ``n_tets``, quality statistics and the refinement/improvement counters.
     """
-    inputs = mesh_to_aura_inputs(mesh)
+    inputs = mesh_to_aura_inputs(mesh, periodic)
     q_before = quality(inputs["nodes"], inputs["tets"])
     result = refine(
         **inputs,

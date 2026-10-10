@@ -51,6 +51,7 @@ def refine(
     face_tri_tags: np.ndarray | None = None,
     curve_edges: np.ndarray | None = None,
     curve_edge_tags: np.ndarray | None = None,
+    periodic_pairs: np.ndarray | None = None,
     brep: BrepSnapshot | None = None,
     growth: float = 0.3,
     order: float = 2.0,
@@ -84,6 +85,9 @@ def refine(
             mix regions, and smoothing never moves nodes on region boundaries.
         face_tris / face_tri_tags: triangles lying on tagged geometric faces.
         curve_edges / curve_edge_tags: edges lying on tagged geometric curves.
+        periodic_pairs: (P, 3) rows ``(k, source_node, target_node)`` for periodic
+            boundary ``k``. Paired faces are refined identically, the maps stay order
+            preserving, and paired nodes are never moved by smoothing.
         brep: Optional geometry snapshot used to project new boundary nodes.
         growth: Target relative increase of the number of tetrahedra (0.3 = +30 %).
         order: Assumed convergence order of the error indicator.
@@ -113,6 +117,8 @@ def refine(
         curve_edge_tags = np.zeros((0,), dtype=np.int32)
     if brep is None:
         brep = BrepSnapshot.empty()
+    if periodic_pairs is None:
+        periodic_pairs = np.zeros((0, 3), dtype=np.int64)
 
     out = _aura.refine(
         nodes,
@@ -123,6 +129,7 @@ def refine(
         np.ascontiguousarray(face_tri_tags, dtype=np.int32),
         np.ascontiguousarray(curve_edges, dtype=np.int64).reshape(-1, 2),
         np.ascontiguousarray(curve_edge_tags, dtype=np.int32),
+        np.ascontiguousarray(periodic_pairs, dtype=np.int64).reshape(-1, 3),
         *brep.as_args(),
         float(growth),
         float(2.0 ** -(order / 3.0 + 0.5)),

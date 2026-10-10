@@ -17,6 +17,14 @@
 //! * a child tetrahedron remembers the index of its original root tetrahedron.
 //!
 //! New nodes on a tagged curve or face are projected back onto the BREP snapshot.
+//!
+//! Periodic boundaries are supported through node maps (one per periodic pair,
+//! source face node -> target face node). An edge on a periodic face is always
+//! split together with all of its periodic images, so paired faces stay exact
+//! translated copies. The new midpoints of such an orbit get consecutive ids in
+//! the lexicographic order of their parent edges, which keeps every map order
+//! preserving (x < y <=> M(x) < M(y)), as EMerge requires for consistent edge
+//! orientations across periodic faces.
 
 use crate::geom::*;
 use std::cmp::Ordering;
@@ -129,6 +137,8 @@ pub struct Refiner<'a> {
     n_alive: usize,
     heap: BinaryHeap<Prio>,
     n0: usize,
+    /// Periodic node maps, one (forward, inverse) pair per periodic boundary.
+    pmap: Vec<(HashMap<u32, u32>, HashMap<u32, u32>)>,
     pub stats: Stats,
 }
 
@@ -196,8 +206,52 @@ impl<'a> Refiner<'a> {
             n_alive: n,
             heap,
             n0: n,
+            pmap: vec![],
             stats: Stats::default(),
         }
+    }
+
+    /// Register periodic node pairs as (map index, source node, target node).
+    pub fn set_periodic(&mut self, pairs: &[(usize, u32, u32)]) {
+        let n_maps = pairs.iter().map(|p| p.0 + 1).max().unwrap_or(0);
+        self.pmap = vec![(HashMap::new(), HashMap::new()); n_maps];
+        for &(k, a, b) in pairs {
+            self.pmap[k].0.insert(a, b);
+            self.pmap[k].1.insert(b, a);
+        }
+    }
+
+    /// All nodes that take part in a periodic map.
+    pub fn periodic_nodes(&self) -> Vec<u32> {
+        let mut v: Vec<u32> = self.pmap.iter().flat_map(|(f, _)| f.keys().chain(f.values()).copied()).collect();
+        v.sort_unstable();
+        v.dedup();
+        v
+    }
+
+    /// The edge together with all its periodic images, sorted lexicographically.
+    fn orbit(&self, e: Edge) -> Vec<Edge> {
+        let mut out = vec![e];
+        if self.pmap.is_empty() {
+            return out;
+        }
+        let mut i = 0;
+        while i < out.len() {
+            let (a, b) = out[i];
+            for (fwd, inv) in &self.pmap {
+                for m in [fwd, inv] {
+                    if let (Some(&x), Some(&y)) = (m.get(&a), m.get(&b)) {
+                        let img = ekey(x, y);
+                        if !out.contains(&img) && self.shell.contains_key(&img) {
+                            out.push(img);
+                        }
+                    }
+                }
+            }
+            i += 1;
+        }
+        out.sort_unstable();
+        out
     }
 
     #[inline]
@@ -235,12 +289,17 @@ impl<'a> Refiner<'a> {
             }
             let e = self.longest_edge(s);
             let lim2 = self.len2(e) / (self.params.lepp_ratio * self.params.lepp_ratio);
-            let blocker = self.shell[&e].iter().copied().find(|&u| {
-                if u == s {
-                    return false;
-                }
-                let lu = self.longest_edge(u);
-                lu != e && self.len2(lu) > lim2
+            // Periodic images of e are split together with it, so their shells
+            // must satisfy the propagation rule as well.
+            let orbit = self.orbit(e);
+            let blocker = orbit.iter().find_map(|&oe| {
+                self.shell[&oe].iter().copied().find(|&u| {
+                    if u == s {
+                        return false;
+                    }
+                    let lu = self.longest_edge(u);
+                    lu != oe && self.len2(lu) > lim2
+                })
             });
             match blocker {
                 Some(u) => stack.push(u),
@@ -346,13 +405,36 @@ impl<'a> Refiner<'a> {
         self.n_alive -= 1;
     }
 
+    /// Split `e` and, if it lies on a periodic face, all of its periodic images.
     pub fn split_edge(&mut self, e: Edge) {
+        let orbit = self.orbit(e);
+        if orbit.len() == 1 {
+            self.split_single(e, true);
+            return;
+        }
+        // Midpoints get consecutive ids in the (lexicographic) order of the
+        // parent edges, which keeps every periodic map order preserving.
+        let mids: Vec<u32> = orbit.iter().map(|&oe| self.split_single(oe, false)).collect();
+        for (fwd, inv) in self.pmap.iter_mut() {
+            for (i, &(a, b)) in orbit.iter().enumerate() {
+                let (Some(&x), Some(&y)) = (fwd.get(&a), fwd.get(&b)) else { continue };
+                if let Some(j) = orbit.iter().position(|&oe| oe == ekey(x, y)) {
+                    fwd.insert(mids[i], mids[j]);
+                    inv.insert(mids[j], mids[i]);
+                }
+            }
+        }
+    }
+
+    /// Split a single edge; returns the new node id.
+    fn split_single(&mut self, e: Edge, project: bool) -> u32 {
         let shell = self.shell.remove(&e).expect("split_edge: edge not in mesh");
         let (a, b) = e;
         let mid = scale(add(self.nodes[a as usize], self.nodes[b as usize]), 0.5);
 
         let mut p = mid;
-        if let Some(target) = self.projected_point(e, &shell, mid) {
+        let target = if project { self.projected_point(e, &shell, mid) } else { None };
+        if let Some(target) = target {
             self.stats.n_projected += 1;
             let mut q = target;
             let mut ok = false;
@@ -403,6 +485,7 @@ impl<'a> Refiner<'a> {
             self.curve_tags.insert(ekey(m, b), tags);
         }
         self.stats.n_splits += 1;
+        m
     }
 
     /// Greedily refine the highest-error tets until the target count is reached.
@@ -539,6 +622,64 @@ mod tests {
             .map(|e| norm(sub(out.nodes[e.0 as usize], out.nodes[e.1 as usize])))
             .sum();
         assert!((total - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn periodic_faces_stay_matched_and_order_preserving() {
+        // 3x1x1 row of cubes; x=0 face is periodic with x=3 face (dv = +3 x).
+        let n = 3u32;
+        let id = |i: u32, j: u32, k: u32| i + (n + 1) * (j + 2 * k);
+        let mut nodes = vec![];
+        for k in 0..2 {
+            for j in 0..2 {
+                for i in 0..=n {
+                    nodes.push([i as f64, j as f64, k as f64]);
+                }
+            }
+        }
+        let mut tets = vec![];
+        for i in 0..n {
+            let c = |b: u32| id(i + (b & 1), (b >> 1) & 1, (b >> 2) & 1);
+            for p in [[1, 2, 4], [1, 4, 2], [2, 1, 4], [2, 4, 1], [4, 1, 2], [4, 2, 1]] {
+                let t = [c(0), c(p[0]), c(p[0] + p[1]), c(7)];
+                let x = t.map(|v| nodes[v as usize]);
+                tets.push(if vol6(x[0], x[1], x[2], x[3]) < 0.0 { [t[0], t[1], t[3], t[2]] } else { t });
+            }
+        }
+        let pairs: Vec<(usize, u32, u32)> =
+            (0..2).flat_map(|k| (0..2).map(move |j| (0usize, id(0, j, k), id(n, j, k)))).collect();
+        // Error concentrated on the source face only.
+        let err: Vec<f64> = tets
+            .iter()
+            .map(|t| if t.iter().any(|&v| nodes[v as usize][0] == 0.0) { 10.0 } else { 1.0 })
+            .collect();
+        let brep = Brep::default();
+        let mut r = Refiner::new(nodes, tets, err, &[], &[], &brep, Params { growth: 4.0, ..Default::default() });
+        r.set_periodic(&pairs);
+        r.run();
+        let fwd = r.pmap[0].0.clone();
+        let out = r.finish();
+
+        let face = |x: f64| -> HashSet<Face> {
+            boundary_faces(&out.tets)
+                .into_iter()
+                .filter(|(f, c)| *c == 1 && f.iter().all(|&v| out.nodes[v as usize][0] == x))
+                .map(|(f, _)| f)
+                .collect()
+        };
+        let (f1, f2) = (face(0.0), face(n as f64));
+        assert!(f1.len() > 2, "source face was not refined");
+        assert_eq!(f1.len(), f2.len());
+        for f in &f1 {
+            let img = f.map(|v| fwd[&v]);
+            // Maps are order preserving, so the image of a sorted face is sorted.
+            assert!(img[0] < img[1] && img[1] < img[2]);
+            assert!(f2.contains(&img), "image of {f:?} missing on target face");
+            for (&v, &w) in f.iter().zip(img.iter()) {
+                let (p, q) = (out.nodes[v as usize], out.nodes[w as usize]);
+                assert!((q[0] - p[0] - n as f64).abs() < 1e-12 && (q[1] - p[1]).abs() < 1e-12 && (q[2] - p[2]).abs() < 1e-12);
+            }
+        }
     }
 
     #[test]

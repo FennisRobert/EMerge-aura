@@ -20,7 +20,8 @@ EMerge's default adaptive mesh refinement (AMR) regenerates the whole mesh with 
    - in-plane sliding of nodes on planar geometric faces.
 
    A change is only accepted if it improves the worst tet it touches. Curve nodes never move, and face nodes never leave their plane.
-4. Every geometric tag is inherited exactly: volumes, faces (boundary conditions!), curves and points. EMerge's `Mesh3D` is rebuilt from that, **without calling GMSH**.
+4. Periodic boundaries are supported. An edge on a periodic face is always split together with all of its periodic images, so paired faces stay exact translated copies. Node numbering stays consistent across each pair, which EMerge needs for consistent edge orientations.
+5. Every geometric tag is inherited exactly: volumes, faces (boundary conditions!), curves and points. EMerge's `Mesh3D` is rebuilt from that, **without calling GMSH**.
 
 On the patch antenna test case it keeps the minimum element quality roughly constant over many passes. At the same tet count it gives more accurate S-parameters than the GMSH remeshing AMR.
 
@@ -66,7 +67,7 @@ For a callable `growth`, `info` contains `n_tets`, `error` (per-tet error indica
 model.adaptive_mesh_refinement(growth=lambda step, info: 1.0 if step < 3 else 0.3)
 ```
 
-Models with periodic boundary conditions are not supported yet. EMerge automatically falls back to GMSH remeshing for those.
+Periodic models (e.g. `em.HexCell` unit cells) work as well. On `test_cases/test_4_periodic.py` (hexagonal waveguide array cell with a PEC sphere and iris), AURA's 21k-tet result is within 0.15 dB of a uniformly fine 26k-tet reference. The GMSH remeshing AMR's 15k-tet result is within 0.5 dB.
 
 ## Standalone API
 
@@ -108,6 +109,7 @@ test_cases/                        EMerge models used for testing, plus check_me
 cargo test --no-default-features                 # Rust unit tests (no Python needed)
 pip install .                                    # build the extension with maturin
 python test_cases/check_mesh_update.py           # Mesh3D consistency checks (requires EMerge)
+python test_cases/check_periodic.py              # periodic face matching / ordering checks (requires EMerge)
 ```
 
 `check_mesh_update.py` verifies that the GMSH-free topology rebuild reproduces EMerge's own `Mesh3D._pre_update` exactly. It also checks that a refined mesh passes `Mesh3D.diagnose()` and keeps every domain volume, face area and tag intact.
@@ -115,7 +117,6 @@ python test_cases/check_mesh_update.py           # Mesh3D consistency checks (re
 ## Known limitations
 
 - Refinement only: the mesh is never coarsened.
-- No periodic boundary conditions yet.
 - Quality improvement only covers the refined region plus `improve_layers` rings of neighbours.
 - Flat tets in thin layers (e.g. a substrate meshed one element thick) cannot be fixed without refining the whole layer, so they stay as they are.
 - The number of tets per pass slightly overshoots the target when the last split has a large shell.

@@ -113,7 +113,7 @@ mod py {
     #[pyfunction]
     #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (
-        nodes, tets, error, tet_region, face_tris, face_tags, curve_edges, curve_edge_tags,
+        nodes, tets, error, tet_region, face_tris, face_tags, curve_edges, curve_edge_tags, periodic_pairs,
         surf_tags, surf_kind, surf_params, samp_owner, samp_pts, samp_nrm,
         curve_tags, curve_kind, curve_params, poly_owner, poly_pts,
         growth, child_factor, max_depth, min_projected_volume, lepp_ratio,
@@ -129,6 +129,7 @@ mod py {
         face_tags: PyReadonlyArray1<'py, i32>,
         curve_edges: PyReadonlyArray2<'py, i64>,
         curve_edge_tags: PyReadonlyArray1<'py, i32>,
+        periodic_pairs: PyReadonlyArray2<'py, i64>,
         surf_tags: PyReadonlyArray1<'py, i32>,
         surf_kind: PyReadonlyArray1<'py, i32>,
         surf_params: PyReadonlyArray2<'py, f64>,
@@ -189,12 +190,18 @@ mod py {
             lepp_ratio,
         };
 
+        let pairs: Vec<(usize, u32, u32)> = rows_u32::<3>(&periodic_pairs)?
+            .into_iter()
+            .map(|r| (r[0] as usize, r[1], r[2]))
+            .collect();
         let iparams =
             ImproveParams { sweeps: improve_sweeps, flip_quality, smooth_iters, layers: improve_layers };
 
         let (mut out, region, istats) = py.allow_threads(|| {
             let mut r = Refiner::new(nodes, tets, error, &faces, &curves, &brep, params);
+            r.set_periodic(&pairs);
             r.run();
+            let periodic_nodes = r.periodic_nodes();
             let mut out = r.finish();
             let region: Vec<i32> = out.tet_root.iter().map(|&i| region_in[i as usize]).collect();
             if iparams.sweeps == 0 {
@@ -217,6 +224,7 @@ mod py {
                 &mut out.nodes, tets, region, root, active, &fixed_faces, &curve_set, iparams,
             );
             imp.set_planar_faces(&face_list, &planar);
+            imp.lock_nodes(&periodic_nodes);
             imp.run();
             let istats = imp.stats.clone();
             let (t, r, o, a) = imp.finish();

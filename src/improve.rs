@@ -188,6 +188,15 @@ impl<'a> Improver<'a> {
         }
     }
 
+    /// Never move these nodes (e.g. nodes on periodic faces, which must stay
+    /// exact translated copies of their partner nodes).
+    pub fn lock_nodes(&mut self, nodes: &[u32]) {
+        for v in nodes {
+            self.slide.remove(v);
+            self.fixed_nodes.insert(*v);
+        }
+    }
+
     // ------------------------------------------------------------------
     // Geometry helpers
     // ------------------------------------------------------------------
