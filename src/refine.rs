@@ -532,9 +532,21 @@ impl<'a> Refiner<'a> {
 
     /// Curve edges along narrow strips that are longer than `ratio` times the
     /// local strip width, most over-long first.
+    ///
+    /// A triangle on a tagged face with an edge on curve A and its apex on another
+    /// curve B is a strip crossing only if the edge lies *opposite* curve B: the
+    /// point of B closest to the edge midpoint must be inside B, not one of B's end
+    /// points. The strip width is that distance. This rejects in-line
+    /// configurations, e.g. two lines of slightly different width meeting at a tiny
+    /// step: there B continues away from A, so its closest point is its own end and
+    /// the apparent "width" would only be the tiny step size.
     fn strip_edges(&self, ratio: f64) -> Vec<(f64, Edge)> {
         let mut node_curves: HashMap<u32, Vec<i32>> = HashMap::new();
+        let mut curve_segs: HashMap<i32, Vec<Edge>> = HashMap::new();
         for (e, tags) in &self.curve_tags {
+            for t in tags {
+                curve_segs.entry(*t).or_default().push(*e);
+            }
             for v in [e.0, e.1] {
                 let nc = node_curves.entry(v).or_default();
                 for t in tags {
@@ -544,6 +556,33 @@ impl<'a> Refiner<'a> {
                 }
             }
         }
+        // Curve end points: nodes used by exactly one segment of that curve.
+        let mut curve_ends: HashMap<i32, Vec<u32>> = HashMap::new();
+        for (t, segs) in &curve_segs {
+            let mut count: HashMap<u32, usize> = HashMap::new();
+            for e in segs {
+                *count.entry(e.0).or_default() += 1;
+                *count.entry(e.1).or_default() += 1;
+            }
+            curve_ends.insert(*t, count.into_iter().filter(|&(_, c)| c == 1).map(|(v, _)| v).collect());
+        }
+        // Distance from p to curve `tag`, and whether the closest point is a curve end.
+        let closest_on_curve = |tag: i32, p: P3| -> (f64, bool) {
+            let mut best = (f64::INFINITY, false);
+            for e in &curve_segs[&tag] {
+                let (a, b) = (self.nodes[e.0 as usize], self.nodes[e.1 as usize]);
+                let ab = sub(b, a);
+                let l2 = dot(ab, ab);
+                let t = if l2 > 0.0 { (dot(sub(p, a), ab) / l2).clamp(0.0, 1.0) } else { 0.0 };
+                let d = norm(sub(p, add(a, scale(ab, t))));
+                if d < best.0 {
+                    let ends = &curve_ends[&tag];
+                    let at_end = (t <= 1e-9 && ends.contains(&e.0)) || (t >= 1.0 - 1e-9 && ends.contains(&e.1));
+                    best = (d, at_end);
+                }
+            }
+            best
+        };
         let none: Vec<i32> = vec![];
         let mut cand: HashMap<Edge, f64> = HashMap::new();
         for f in self.face_tags.keys() {
@@ -558,11 +597,17 @@ impl<'a> Refiner<'a> {
                 if !oc.iter().any(|c| !ct.contains(c) && !c0.contains(c) && !c1.contains(c)) {
                     continue;
                 }
-                let (a, b, o) = (self.nodes[e.0 as usize], self.nodes[e.1 as usize], self.nodes[apex as usize]);
-                let ab = sub(b, a);
-                let len = norm(ab);
-                let w = norm(cross(ab, sub(o, a))) / len;
-                if w > 0.0 && len > ratio * w {
+                let mid = scale(add(self.nodes[e.0 as usize], self.nodes[e.1 as usize]), 0.5);
+                // Strip width = distance from the edge midpoint to an opposite curve B.
+                let mut w = f64::INFINITY;
+                for &tag in oc.iter().filter(|c| !ct.contains(c) && !c0.contains(c) && !c1.contains(c)) {
+                    let (d, at_end) = closest_on_curve(tag, mid);
+                    if !at_end {
+                        w = w.min(d);
+                    }
+                }
+                let len = self.len2(e).sqrt();
+                if w.is_finite() && w > 0.0 && len > ratio * w {
                     let s = cand.entry(e).or_insert(0.0);
                     *s = s.max(len / (ratio * w));
                 }
