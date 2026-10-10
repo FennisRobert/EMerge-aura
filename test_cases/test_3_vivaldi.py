@@ -131,7 +131,7 @@ rx, ry = pcbl.load(
 ).xy  # Here we take the X,Y coordinates at the end of our feed line
 
 # Finally we place our stub. We lower is by 0.2mm to make it sit flush with the line due to the rotation.
-pcbl.radial_stub((rx, ry - 0.2), Lstub, stub_ang, (dx, dy), w0=w0)
+pcbl.radial_stub((rx, ry - 0.4), Lstub, stub_ang, (dx, dy), w0=w0)
 
 # Finallly we compile all the polygons into a single metal trace.
 polies = pcbl.compile_paths(merge=True)
