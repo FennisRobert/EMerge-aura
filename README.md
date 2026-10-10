@@ -23,7 +23,11 @@ EMerge's default adaptive mesh refinement (AMR) regenerates the whole mesh with 
 4. Periodic boundaries are supported. An edge on a periodic face is always split together with all of its periodic images, so paired faces stay exact translated copies. Node numbering stays consistent across each pair, which EMerge needs for consistent edge orientations.
 5. Every geometric tag is inherited exactly: volumes, faces (boundary conditions!), curves and points. EMerge's `Mesh3D` is rebuilt from that, **without calling GMSH**.
 
-On the patch antenna test case it keeps the minimum element quality roughly constant over many passes. At the same tet count it gives more accurate S-parameters than the GMSH remeshing AMR.
+### Why
+
+Speed. Regenerating the whole mesh every pass is slow on complex geometries with many edges and faces, such as PCBs. The size-field interpolation of the remeshing method also gets very expensive at high tet counts. AURA's cost per pass grows only with the number of tets and doesn't depend on how complicated the geometry is.
+
+The GMSH remeshing AMR builds a fresh, globally optimised mesh every pass, so it remains the reference for mesh quality. AURA aims to stay close to it while being much faster. On smooth geometries with few edges and low tet counts the speed gain is small: about 1.5× for the mesh-update step at 130k tets on the patch antenna test case. That test case also shows AURA keeping the minimum element quality roughly constant over many passes.
 
 ## Installation
 
@@ -67,7 +71,7 @@ For a callable `growth`, `info` contains `n_tets`, `error` (per-tet error indica
 model.adaptive_mesh_refinement(growth=lambda step, info: 1.0 if step < 3 else 0.3)
 ```
 
-Periodic models (e.g. `em.HexCell` unit cells) work as well. On `test_cases/test_4_periodic.py` (hexagonal waveguide array cell with a PEC sphere and iris), AURA's 21k-tet result is within 0.15 dB of a uniformly fine 26k-tet reference. The GMSH remeshing AMR's 15k-tet result is within 0.5 dB.
+Periodic models (e.g. `em.HexCell` unit cells) work as well. On `test_cases/test_4_periodic.py` (hexagonal waveguide array cell with a PEC sphere and iris), the AURA AMR result is within 0.15 dB of a uniformly fine reference mesh.
 
 ## Standalone API
 
