@@ -51,7 +51,7 @@ iris_r = em.geo.XYPlate(w_iris, wgb, position=(wga / 2 - w_iris, -wgb / 2, -fl /
 model.commit_geometry()
 
 model.mw.set_frequency_range(2.8e9, 3.3e9, 5)
-model.mw.set_resolution(0.1)
+model.mw.set_resolution(0.3)
 
 # Then we create our mesh and view the result
 model.generate_mesh()
@@ -64,15 +64,15 @@ abc = model.mw.bc.AbsorbingBoundary(box.back)
 periodic_cell.set_scanangle(30, 45)
 model.view(bc=True)
 
-model.adaptive_mesh_refinement(show_mesh=True)
+model.adaptive_mesh_refinement(minimum_steps=6, show_mesh=False)
 data = model.mw.run_sweep()
 
 model.display.add_object(waveguide)
 model.display.add_object(box)
 model.display.animate().cbar("Ey").add_field(
-    data.field[0].cutplane(3 * mm, y=0).scalar("Ey", "complex"), symmetrize=True
+    data.field[0].cutplane(1 * mm, y=0).scalar("Ey", "complex"), symmetrize=True
 )
 model.display.animate().cbar("Ey").add_field(
-    data.field[0].cutplane(3 * mm, x=0).scalar("Ey", "complex"), symmetrize=True
+    data.field[0].cutplane(1 * mm, x=0).scalar("Ey", "complex"), symmetrize=True
 )
 model.display.show()

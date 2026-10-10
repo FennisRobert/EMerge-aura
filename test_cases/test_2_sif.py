@@ -88,7 +88,7 @@ model.mw.set_frequency_range(0.2e9, 8e9, 41)
 model.generate_mesh()
 model.view(bc=True)
 model.set_solver(em.EMSolver.SPARTA)
-model.adaptive_mesh_refinement(max_steps=15, frequency=1e9, growth=0.3)
+model.adaptive_mesh_refinement(max_steps=15, frequency=1e9, growth=0.3, show_mesh=True)
 
 # Finally we execute the frequency domain sweep and compute the Scattering Parameters.
 sol = model.mw.run_adaptive_sweep()
