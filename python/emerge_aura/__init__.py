@@ -18,7 +18,12 @@ import numpy as np
 from . import _aura
 from .brep import BrepSnapshot
 
-__version__ = "0.1.0"
+try:
+    from importlib.metadata import PackageNotFoundError, version
+
+    __version__ = version("emerge-aura")
+except PackageNotFoundError:  # running from a source tree without installation
+    __version__ = "0.0.0"
 
 __all__ = ["BrepSnapshot", "RefineResult", "refine", "quality", "__version__"]
 

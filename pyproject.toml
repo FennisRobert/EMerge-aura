@@ -4,16 +4,33 @@ build-backend = "maturin"
 
 [project]
 name = "emerge-aura"
-version = "0.1.0"
+# The version is taken from Cargo.toml (single source of truth).
+dynamic = ["version"]
 description = "AURA (Adaptive Unstructured Refinement Algorithm): local tetrahedral mesh refinement for the EMerge FEM solver"
 readme = "README.md"
 license = { text = "GPL-2.0-or-later" }
+authors = [{ name = "Robert Fennis" }]
 requires-python = ">=3.9"
 dependencies = ["numpy>=1.22"]
+keywords = ["fem", "mesh", "adaptive mesh refinement", "tetrahedral", "emerge"]
 classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: GNU General Public License v2 or later (GPLv2+)",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
     "Programming Language :: Rust",
     "Programming Language :: Python :: Implementation :: CPython",
+    "Topic :: Scientific/Engineering :: Physics",
 ]
+
+[project.urls]
+Homepage = "https://github.com/FennisRobert/EMerge-aura"
+Repository = "https://github.com/FennisRobert/EMerge-aura"
+Issues = "https://github.com/FennisRobert/EMerge-aura/issues"
+EMerge = "https://github.com/FennisRobert/EMerge"
 
 [project.optional-dependencies]
 dev = ["pytest"]
@@ -22,3 +39,8 @@ dev = ["pytest"]
 python-source = "python"
 module-name = "emerge_aura._aura"
 features = ["python"]
+exclude = [
+    { path = "test_cases/**", format = "sdist" },
+    { path = ".github/**", format = "sdist" },
+    { path = "program_plan.md", format = "sdist" },
+]

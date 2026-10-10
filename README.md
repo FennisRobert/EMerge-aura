@@ -31,15 +31,17 @@ The GMSH remeshing AMR builds a fresh, globally optimised mesh every pass, so it
 
 ## Installation
 
-You need a Rust toolchain (<https://rustup.rs>), at least until prebuilt wheels are published:
+```bash
+pip install emerge-aura
+```
+
+Prebuilt wheels are published for Linux (x86_64, aarch64), macOS (Apple Silicon, Intel) and Windows (x64), for Python 3.9 and newer. On other platforms pip builds from source, which needs a Rust toolchain (<https://rustup.rs>). To install the latest development version:
 
 ```bash
 pip install git+https://github.com/FennisRobert/EMerge-aura.git
-# or, from a local clone
-pip install ./EMerge-aura
 ```
 
-Once it is on PyPI it will also install as an EMerge extra: `pip install emerge[aura]`.
+It will also install as an EMerge extra: `pip install emerge[aura]`.
 
 `emerge-aura` only depends on `numpy`. It does not import EMerge.
 
@@ -117,6 +119,15 @@ python test_cases/check_periodic.py              # periodic face matching / orde
 ```
 
 `check_mesh_update.py` verifies that the GMSH-free topology rebuild reproduces EMerge's own `Mesh3D._pre_update` exactly. It also checks that a refined mesh passes `Mesh3D.diagnose()` and keeps every domain volume, face area and tag intact.
+
+## Releasing
+
+Wheels for all platforms are built by GitHub Actions (`.github/workflows/release.yml`) on every push and pull request. To publish a release to PyPI:
+
+1. Bump `version` in `Cargo.toml`. It is the single source of the package version.
+2. Commit, then tag and push: `git tag v0.1.1 && git push origin main v0.1.1`.
+
+The workflow checks that the tag matches `Cargo.toml`, builds and smoke-tests all wheels, and uploads them with the sdist to PyPI using Trusted Publishing.
 
 ## Known limitations
 
