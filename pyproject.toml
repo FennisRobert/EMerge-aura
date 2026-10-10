@@ -1,0 +1,24 @@
+[build-system]
+requires = ["maturin>=1.5,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "emerge-aura"
+version = "0.1.0"
+description = "AURA (Adaptive Unstructured Refinement Algorithm): local tetrahedral mesh refinement for the EMerge FEM solver"
+readme = "README.md"
+license = { text = "GPL-2.0-or-later" }
+requires-python = ">=3.9"
+dependencies = ["numpy>=1.22"]
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: Implementation :: CPython",
+]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[tool.maturin]
+python-source = "python"
+module-name = "emerge_aura._aura"
+features = ["python"]

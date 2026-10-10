@@ -1,0 +1,570 @@
+//! Conforming local refinement of a tetrahedral mesh by longest-edge bisection.
+//!
+//! Refinement is done exclusively by *edge splits*: an edge `(a, b)` receives a
+//! midpoint `m` and every tetrahedron in the shell around that edge is replaced
+//! by its two halves. The mesh is therefore conforming after every single
+//! operation, so no hanging-node closure step is required.
+//!
+//! To keep element quality bounded, a tetrahedron is only ever bisected through
+//! its own longest edge (Rivara's LEPP strategy): before splitting edge `e`,
+//! every tet in its shell whose longest edge is not `e` is first refined
+//! itself. Edges are compared with a strict total order (length, then node ids)
+//! so the propagation path strictly increases and always terminates.
+//!
+//! Geometric classification is carried along with every split:
+//! * a sub-segment of a tagged curve edge keeps the curve tag(s),
+//! * a sub-triangle of a tagged face triangle keeps the face tag(s),
+//! * a child tetrahedron remembers the index of its original root tetrahedron.
+//!
+//! New nodes on a tagged curve or face are projected back onto the BREP snapshot.
+
+use crate::geom::*;
+use std::cmp::Ordering;
+use std::collections::{BinaryHeap, HashMap};
+
+pub type Edge = (u32, u32);
+pub type Face = [u32; 3];
+
+#[inline]
+fn ekey(a: u32, b: u32) -> Edge {
+    if a < b {
+        (a, b)
+    } else {
+        (b, a)
+    }
+}
+
+#[inline]
+fn fkey(a: u32, b: u32, c: u32) -> Face {
+    let mut f = [a, b, c];
+    f.sort_unstable();
+    f
+}
+
+const TET_EDGES: [(usize, usize); 6] = [(0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3)];
+
+#[inline]
+pub fn vol6(a: P3, b: P3, c: P3, d: P3) -> f64 {
+    dot(sub(b, a), cross(sub(c, a), sub(d, a)))
+}
+
+/// Mean-ratio quality: 1 for a regular tetrahedron, 0 for a degenerate one.
+pub fn mean_ratio(a: P3, b: P3, c: P3, d: P3) -> f64 {
+    let v = vol6(a, b, c, d).abs() / 6.0;
+    let pts = [a, b, c, d];
+    let mut l2 = 0.0;
+    for (i, j) in TET_EDGES {
+        let e = sub(pts[i], pts[j]);
+        l2 += dot(e, e);
+    }
+    if l2 == 0.0 {
+        return 0.0;
+    }
+    12.0 * (3.0 * v).powf(2.0 / 3.0) / l2
+}
+
+#[derive(Clone, Copy, PartialEq)]
+struct Prio(f64, u32);
+impl Eq for Prio {}
+impl PartialOrd for Prio {
+    fn partial_cmp(&self, o: &Self) -> Option<Ordering> {
+        Some(self.cmp(o))
+    }
+}
+impl Ord for Prio {
+    fn cmp(&self, o: &Self) -> Ordering {
+        self.0.total_cmp(&o.0).then_with(|| o.1.cmp(&self.1))
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct Params {
+    /// Target relative increase of the number of tetrahedra (0.3 = +30 %).
+    pub growth: f64,
+    /// Error multiplier assigned to both children of a bisected tetrahedron.
+    pub child_factor: f64,
+    /// Maximum number of bisection generations per pass for a selected tet.
+    pub max_depth: u8,
+    /// Minimum child volume (relative to an exact half) accepted after projection.
+    pub min_projected_volume: f64,
+    /// A neighbour may be bisected through a shared edge that is not its own
+    /// longest edge if that edge is at least this fraction of its longest edge.
+    /// 1.0 is strict longest-edge propagation (LEPP); lower values limit how far
+    /// refinement spreads into large neighbouring elements, at some cost in quality.
+    pub lepp_ratio: f64,
+}
+
+impl Default for Params {
+    fn default() -> Self {
+        Params {
+            growth: 0.3,
+            child_factor: 2f64.powf(-(2.0 / 3.0 + 0.5)),
+            max_depth: 6,
+            min_projected_volume: 0.2,
+            lepp_ratio: 0.7,
+        }
+    }
+}
+
+#[derive(Default, Clone, Debug)]
+pub struct Stats {
+    pub n_splits: usize,
+    pub n_projected: usize,
+    pub n_projection_reduced: usize,
+    pub n_projection_rejected: usize,
+}
+
+pub struct Refiner<'a> {
+    pub nodes: Vec<P3>,
+    pub tets: Vec<[u32; 4]>,
+    alive: Vec<bool>,
+    pub root: Vec<u32>,
+    err: Vec<f64>,
+    depth: Vec<u8>,
+    shell: HashMap<Edge, Vec<u32>>,
+    pub face_tags: HashMap<Face, Vec<i32>>,
+    pub curve_tags: HashMap<Edge, Vec<i32>>,
+    brep: &'a Brep,
+    params: Params,
+    n_alive: usize,
+    heap: BinaryHeap<Prio>,
+    n0: usize,
+    pub stats: Stats,
+}
+
+pub struct Output {
+    pub nodes: Vec<P3>,
+    pub tets: Vec<[u32; 4]>,
+    pub tet_root: Vec<u32>,
+    /// True for tets created in this pass (as opposed to untouched input tets).
+    pub tet_new: Vec<bool>,
+    pub face_tris: Vec<Face>,
+    pub face_tri_tags: Vec<i32>,
+    pub curve_edges: Vec<Edge>,
+    pub curve_edge_tags: Vec<i32>,
+    pub stats: Stats,
+}
+
+impl<'a> Refiner<'a> {
+    pub fn new(
+        nodes: Vec<P3>,
+        tets: Vec<[u32; 4]>,
+        err: Vec<f64>,
+        face_tris: &[(Face, i32)],
+        curve_edges: &[(Edge, i32)],
+        brep: &'a Brep,
+        params: Params,
+    ) -> Self {
+        let n = tets.len();
+        let mut shell: HashMap<Edge, Vec<u32>> = HashMap::with_capacity(n * 2);
+        for (it, t) in tets.iter().enumerate() {
+            for (i, j) in TET_EDGES {
+                shell.entry(ekey(t[i], t[j])).or_default().push(it as u32);
+            }
+        }
+        let mut face_tags: HashMap<Face, Vec<i32>> = HashMap::new();
+        for (f, tag) in face_tris {
+            let v = face_tags.entry(fkey(f[0], f[1], f[2])).or_default();
+            if !v.contains(tag) {
+                v.push(*tag);
+            }
+        }
+        let mut curve_tags: HashMap<Edge, Vec<i32>> = HashMap::new();
+        for (e, tag) in curve_edges {
+            let v = curve_tags.entry(ekey(e.0, e.1)).or_default();
+            if !v.contains(tag) {
+                v.push(*tag);
+            }
+        }
+        let heap = err
+            .iter()
+            .enumerate()
+            .map(|(i, &e)| Prio(if e.is_finite() { e } else { 0.0 }, i as u32))
+            .collect();
+        Refiner {
+            nodes,
+            alive: vec![true; n],
+            root: (0..n as u32).collect(),
+            depth: vec![0; n],
+            err,
+            tets,
+            shell,
+            face_tags,
+            curve_tags,
+            brep,
+            params,
+            n_alive: n,
+            heap,
+            n0: n,
+            stats: Stats::default(),
+        }
+    }
+
+    #[inline]
+    fn len2(&self, e: Edge) -> f64 {
+        let d = sub(self.nodes[e.0 as usize], self.nodes[e.1 as usize]);
+        dot(d, d)
+    }
+
+    /// Strict total order on edges: length first, node ids as tie-breaker.
+    #[inline]
+    fn edge_cmp(&self, a: Edge, b: Edge) -> Ordering {
+        self.len2(a).total_cmp(&self.len2(b)).then_with(|| a.cmp(&b))
+    }
+
+    fn longest_edge(&self, it: u32) -> Edge {
+        let t = self.tets[it as usize];
+        let mut best = ekey(t[0], t[1]);
+        for (i, j) in TET_EDGES.iter().skip(1) {
+            let e = ekey(t[*i], t[*j]);
+            if self.edge_cmp(e, best) == Ordering::Greater {
+                best = e;
+            }
+        }
+        best
+    }
+
+    /// Refine tet `it` through its longest edge, refining neighbours first where
+    /// needed so that every split edge is the longest edge of all tets around it.
+    pub fn refine_tet(&mut self, it: u32) {
+        let mut stack = vec![it];
+        while let Some(&s) = stack.last() {
+            if !self.alive[s as usize] {
+                stack.pop();
+                continue;
+            }
+            let e = self.longest_edge(s);
+            let lim2 = self.len2(e) / (self.params.lepp_ratio * self.params.lepp_ratio);
+            let blocker = self.shell[&e].iter().copied().find(|&u| {
+                if u == s {
+                    return false;
+                }
+                let lu = self.longest_edge(u);
+                lu != e && self.len2(lu) > lim2
+            });
+            match blocker {
+                Some(u) => stack.push(u),
+                None => {
+                    self.split_edge(e);
+                    stack.pop();
+                }
+            }
+        }
+    }
+
+    /// Projection target for the midpoint of `e`, if `e` lies on a curved curve/face.
+    fn projected_point(&self, e: Edge, shell: &[u32], mid: P3) -> Option<P3> {
+        if let Some(tags) = self.curve_tags.get(&e) {
+            for t in tags {
+                if let Some(c) = self.brep.curves.get(t) {
+                    return match c {
+                        Curve::Straight => None,
+                        _ => Some(c.project(mid)),
+                    };
+                }
+            }
+            // A curve edge without a curve descriptor stays straight; do not
+            // fall through to a face projection, which would pull it off the curve.
+            return None;
+        }
+        for &it in shell {
+            let t = self.tets[it as usize];
+            for &o in t.iter() {
+                if o == e.0 || o == e.1 {
+                    continue;
+                }
+                if let Some(tags) = self.face_tags.get(&fkey(e.0, e.1, o)) {
+                    for tag in tags {
+                        if let Some(s) = self.brep.surfaces.get(tag) {
+                            return match s {
+                                Surface::Flat => None,
+                                _ => Some(s.project(mid)),
+                            };
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Check that inserting `p` on edge `e` keeps every child well shaped.
+    fn placement_ok(&self, e: Edge, shell: &[u32], p: P3) -> bool {
+        let lim = self.params.min_projected_volume;
+        for &it in shell {
+            let t = self.tets[it as usize];
+            let x = t.map(|i| self.nodes[i as usize]);
+            let v = vol6(x[0], x[1], x[2], x[3]);
+            for drop in [e.0, e.1] {
+                let mut y = x;
+                for k in 0..4 {
+                    if t[k] == drop {
+                        y[k] = p;
+                    }
+                }
+                let vc = vol6(y[0], y[1], y[2], y[3]);
+                // Same orientation as the parent and at least `lim` of an exact half.
+                if vc * v.signum() < lim * 0.5 * v.abs() {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    fn push_tet(&mut self, t: [u32; 4], root: u32, err: f64, depth: u8) {
+        let it = self.tets.len() as u32;
+        self.tets.push(t);
+        self.alive.push(true);
+        self.root.push(root);
+        self.err.push(err);
+        self.depth.push(depth);
+        for (i, j) in TET_EDGES {
+            self.shell.entry(ekey(t[i], t[j])).or_default().push(it);
+        }
+        self.heap.push(Prio(err, it));
+        self.n_alive += 1;
+    }
+
+    fn kill_tet(&mut self, it: u32, skip: Edge) {
+        let t = self.tets[it as usize];
+        for (i, j) in TET_EDGES {
+            let k = ekey(t[i], t[j]);
+            if k == skip {
+                continue;
+            }
+            if let Some(v) = self.shell.get_mut(&k) {
+                if let Some(pos) = v.iter().position(|&x| x == it) {
+                    v.swap_remove(pos);
+                }
+                if v.is_empty() {
+                    self.shell.remove(&k);
+                }
+            }
+        }
+        self.alive[it as usize] = false;
+        self.n_alive -= 1;
+    }
+
+    pub fn split_edge(&mut self, e: Edge) {
+        let shell = self.shell.remove(&e).expect("split_edge: edge not in mesh");
+        let (a, b) = e;
+        let mid = scale(add(self.nodes[a as usize], self.nodes[b as usize]), 0.5);
+
+        let mut p = mid;
+        if let Some(target) = self.projected_point(e, &shell, mid) {
+            self.stats.n_projected += 1;
+            let mut q = target;
+            let mut ok = false;
+            for attempt in 0..5 {
+                if self.placement_ok(e, &shell, q) {
+                    ok = true;
+                    if attempt > 0 {
+                        self.stats.n_projection_reduced += 1;
+                    }
+                    break;
+                }
+                q = scale(add(q, mid), 0.5);
+            }
+            if ok {
+                p = q;
+            } else {
+                self.stats.n_projection_rejected += 1;
+            }
+        }
+
+        let m = self.nodes.len() as u32;
+        self.nodes.push(p);
+
+        for &it in &shell {
+            let t = self.tets[it as usize];
+            self.kill_tet(it, e);
+            let root = self.root[it as usize];
+            let err = self.err[it as usize] * self.params.child_factor;
+            let depth = self.depth[it as usize].saturating_add(1);
+            // Replacing one vertex by m keeps the orientation of the parent.
+            let c1 = t.map(|x| if x == b { m } else { x });
+            let c2 = t.map(|x| if x == a { m } else { x });
+            self.push_tet(c1, root, err, depth);
+            self.push_tet(c2, root, err, depth);
+
+            for &o in t.iter() {
+                if o == a || o == b {
+                    continue;
+                }
+                if let Some(tags) = self.face_tags.remove(&fkey(a, b, o)) {
+                    self.face_tags.insert(fkey(a, m, o), tags.clone());
+                    self.face_tags.insert(fkey(m, b, o), tags);
+                }
+            }
+        }
+        if let Some(tags) = self.curve_tags.remove(&e) {
+            self.curve_tags.insert(ekey(a, m), tags.clone());
+            self.curve_tags.insert(ekey(m, b), tags);
+        }
+        self.stats.n_splits += 1;
+    }
+
+    /// Greedily refine the highest-error tets until the target count is reached.
+    pub fn run(&mut self) {
+        let target = ((1.0 + self.params.growth) * self.n_alive as f64).round() as usize;
+        while self.n_alive < target {
+            let Some(Prio(_, it)) = self.heap.pop() else { break };
+            if !self.alive[it as usize] || self.depth[it as usize] >= self.params.max_depth {
+                continue;
+            }
+            self.refine_tet(it);
+        }
+    }
+
+    pub fn finish(self) -> Output {
+        let mut tets = Vec::with_capacity(self.n_alive);
+        let mut tet_root = Vec::with_capacity(self.n_alive);
+        let mut tet_new = Vec::with_capacity(self.n_alive);
+        for (i, t) in self.tets.iter().enumerate() {
+            if self.alive[i] {
+                tets.push(*t);
+                tet_root.push(self.root[i]);
+                tet_new.push(i >= self.n0);
+            }
+        }
+        let mut faces: Vec<(Face, i32)> = self
+            .face_tags
+            .iter()
+            .flat_map(|(f, tags)| tags.iter().map(move |t| (*f, *t)))
+            .collect();
+        faces.sort_unstable();
+        let mut curves: Vec<(Edge, i32)> = self
+            .curve_tags
+            .iter()
+            .flat_map(|(e, tags)| tags.iter().map(move |t| (*e, *t)))
+            .collect();
+        curves.sort_unstable();
+        Output {
+            nodes: self.nodes,
+            tets,
+            tet_root,
+            tet_new,
+            face_tris: faces.iter().map(|x| x.0).collect(),
+            face_tri_tags: faces.iter().map(|x| x.1).collect(),
+            curve_edges: curves.iter().map(|x| x.0).collect(),
+            curve_edge_tags: curves.iter().map(|x| x.1).collect(),
+            stats: self.stats,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    /// Unit cube split into 6 tets (Kuhn triangulation), all positively oriented.
+    fn cube() -> (Vec<P3>, Vec<[u32; 4]>) {
+        let mut nodes = vec![];
+        for k in 0..2 {
+            for j in 0..2 {
+                for i in 0..2 {
+                    nodes.push([i as f64, j as f64, k as f64]);
+                }
+            }
+        }
+        let paths = [[1, 2, 4], [1, 4, 2], [2, 1, 4], [2, 4, 1], [4, 1, 2], [4, 2, 1]];
+        let mut tets = vec![];
+        for p in paths {
+            let v1 = p[0];
+            let v2 = v1 + p[1];
+            let mut t = [0u32, v1, v2, 7];
+            let x = t.map(|i| nodes[i as usize]);
+            if vol6(x[0], x[1], x[2], x[3]) < 0.0 {
+                t.swap(2, 3);
+            }
+            tets.push(t);
+        }
+        (nodes, tets)
+    }
+
+    fn boundary_faces(tets: &[[u32; 4]]) -> HashMap<Face, usize> {
+        let mut count: HashMap<Face, usize> = HashMap::new();
+        for t in tets {
+            for skip in 0..4 {
+                let v: Vec<u32> = (0..4).filter(|&k| k != skip).map(|k| t[k]).collect();
+                *count.entry(fkey(v[0], v[1], v[2])).or_default() += 1;
+            }
+        }
+        count
+    }
+
+    #[test]
+    fn refinement_is_conforming_and_tagged() {
+        let (nodes, tets) = cube();
+        let n0 = tets.len();
+        let err: Vec<f64> = (0..n0).map(|i| if i == 0 { 10.0 } else { 1.0 }).collect();
+        // Tag every boundary face of the cube with tag 1, every boundary edge on x=0,y=0 with curve 7.
+        let bf: Vec<(Face, i32)> = boundary_faces(&tets)
+            .into_iter()
+            .filter(|(_, c)| *c == 1)
+            .map(|(f, _)| (f, 1))
+            .collect();
+        let curve = vec![((0u32, 4u32), 7)];
+        let brep = Brep::default();
+        let params = Params { growth: 5.0, ..Default::default() };
+        let mut r = Refiner::new(nodes, tets, err, &bf, &curve, &brep, params);
+        r.run();
+        let out = r.finish();
+        assert!(out.tets.len() >= 6 * 6);
+
+        // Volume preserved and all tets positively oriented.
+        let mut vol = 0.0;
+        for t in &out.tets {
+            let x = t.map(|i| out.nodes[i as usize]);
+            let v = vol6(x[0], x[1], x[2], x[3]);
+            assert!(v > 0.0);
+            vol += v / 6.0;
+        }
+        assert!((vol - 1.0).abs() < 1e-12);
+
+        // Conformity: each face shared by at most two tets, and boundary faces
+        // (shared by one) are exactly the tagged faces.
+        let count = boundary_faces(&out.tets);
+        assert!(count.values().all(|&c| c <= 2));
+        let bnd: HashSet<Face> = count.iter().filter(|(_, &c)| c == 1).map(|(f, _)| *f).collect();
+        let tagged: HashSet<Face> = out.face_tris.iter().copied().collect();
+        assert_eq!(bnd, tagged);
+
+        // Curve edges still cover the original segment from node 0 to node 4.
+        let total: f64 = out
+            .curve_edges
+            .iter()
+            .map(|e| norm(sub(out.nodes[e.0 as usize], out.nodes[e.1 as usize])))
+            .sum();
+        assert!((total - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn quality_stays_bounded() {
+        let (nodes, tets) = cube();
+        let q0 = tets
+            .iter()
+            .map(|t| {
+                let x = t.map(|i| nodes[i as usize]);
+                mean_ratio(x[0], x[1], x[2], x[3])
+            })
+            .fold(f64::INFINITY, f64::min);
+        let err = vec![1.0; tets.len()];
+        let brep = Brep::default();
+        let params = Params { growth: 60.0, max_depth: 30, ..Default::default() };
+        let mut r = Refiner::new(nodes, tets, err, &[], &[], &brep, params);
+        r.run();
+        let out = r.finish();
+        let q = out
+            .tets
+            .iter()
+            .map(|t| {
+                let x = t.map(|i| out.nodes[i as usize]);
+                mean_ratio(x[0], x[1], x[2], x[3])
+            })
+            .fold(f64::INFINITY, f64::min);
+        assert!(q > 0.3 * q0, "min quality dropped from {q0} to {q}");
+    }
+}
