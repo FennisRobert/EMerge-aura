@@ -67,6 +67,9 @@ def refine(
     flip_quality: float = 0.6,
     smooth_iters: int = 2,
     improve_layers: int = 2,
+    improve_global: bool = False,
+    strip_ratio: float = 0.0,
+    strip_max_growth: float = 2.0,
 ) -> RefineResult:
     """Refine a tetrahedral mesh locally until it has ``(1 + growth)`` times as many tets.
 
@@ -75,6 +78,10 @@ def refine(
     reduction of an h^order error indicator integrated over half the volume), so
     a high-error tet can be bisected several times in one pass while refinement
     still spreads to the next-worst regions.
+
+    With ``strip_ratio > 0`` a geometric step 0 runs first: curve edges along narrow
+    strips (e.g. thin PCB traces) are split until they are at most ``strip_ratio``
+    times the local strip width, so the triangles across the strip are not slivers.
 
     Afterwards the new tets and ``improve_layers`` rings of neighbouring old tets
     are improved by 2-3 flips, edge removal (3 to 7 tets around an edge) and smart
@@ -108,6 +115,10 @@ def refine(
         smooth_iters: Smoothing iterations per sweep.
         improve_layers: Rings of node-adjacent old tets around the refined region that
             are improved as well (where new and old elements meet).
+        improve_global: Improve the whole mesh instead of only the refined region.
+        strip_ratio: Step 0 narrow-strip regularisation: maximum curve-edge length along
+            a narrow strip relative to its width (e.g. 4). 0 disables it.
+        strip_max_growth: Step 0 stops once the tet count has grown by this fraction.
     """
     nodes = np.ascontiguousarray(nodes, dtype=np.float64)
     tets = np.ascontiguousarray(tets, dtype=np.int64)
@@ -145,6 +156,9 @@ def refine(
         float(flip_quality),
         int(smooth_iters),
         int(improve_layers),
+        bool(improve_global),
+        float(strip_ratio),
+        float(strip_max_growth),
     )
     return RefineResult(**out)
 

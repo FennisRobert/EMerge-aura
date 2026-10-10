@@ -120,6 +120,8 @@ pub struct Stats {
     pub n_projected: usize,
     pub n_projection_reduced: usize,
     pub n_projection_rejected: usize,
+    /// Curve edges split by the narrow-strip regularisation (step 0).
+    pub n_strip_splits: usize,
 }
 
 pub struct Refiner<'a> {
@@ -207,6 +209,7 @@ impl<'a> Refiner<'a> {
             heap,
             n0: n,
             pmap: vec![],
+
             stats: Stats::default(),
         }
     }
@@ -488,6 +491,88 @@ impl<'a> Refiner<'a> {
         m
     }
 
+    /// Step 0: geometric regularisation of narrow strips.
+    ///
+    /// A narrow strip (e.g. a thin PCB trace) shows up as a tagged face triangle
+    /// with one edge on a geometric curve and its apex on a *different* curve that
+    /// does not touch that edge. Its height is the local strip width `w`. When the
+    /// node spacing along the strip is much larger than `w`, every triangle across
+    /// the strip is a sliver whatever the triangulation. Such curve edges are split
+    /// (conformingly, with their periodic images) until they are at most `ratio * w`
+    /// long. The long diagonals this leaves inside the strip are removed afterwards
+    /// by the surface flips of the improvement step. Needs no field information,
+    /// only the face/curve tags.
+    ///
+    /// Stops early once `max_tets` tetrahedra exist. Returns the number of splits.
+    pub fn regularize_strips(&mut self, ratio: f64, max_tets: usize) -> usize {
+        let mut total = 0;
+        for _iter in 0..30 {
+            let order = self.strip_edges(ratio);
+            if order.is_empty() {
+                break;
+            }
+            let mut split_any = false;
+            for (_, e) in order {
+                if self.n_alive >= max_tets {
+                    return total;
+                }
+                if self.shell.contains_key(&e) {
+                    self.split_edge(e);
+                    self.stats.n_strip_splits += 1;
+                    total += 1;
+                    split_any = true;
+                }
+            }
+            if !split_any {
+                break;
+            }
+        }
+        total
+    }
+
+    /// Curve edges along narrow strips that are longer than `ratio` times the
+    /// local strip width, most over-long first.
+    fn strip_edges(&self, ratio: f64) -> Vec<(f64, Edge)> {
+        let mut node_curves: HashMap<u32, Vec<i32>> = HashMap::new();
+        for (e, tags) in &self.curve_tags {
+            for v in [e.0, e.1] {
+                let nc = node_curves.entry(v).or_default();
+                for t in tags {
+                    if !nc.contains(t) {
+                        nc.push(*t);
+                    }
+                }
+            }
+        }
+        let none: Vec<i32> = vec![];
+        let mut cand: HashMap<Edge, f64> = HashMap::new();
+        for f in self.face_tags.keys() {
+            for k in 0..3 {
+                let e = ekey(f[k], f[(k + 1) % 3]);
+                let apex = f[(k + 2) % 3];
+                let Some(ct) = self.curve_tags.get(&e) else { continue };
+                let Some(oc) = node_curves.get(&apex) else { continue };
+                // The apex must lie on some curve that touches neither the edge
+                // nor its endpoints; otherwise this is a corner, not a strip.
+                let (c0, c1) = (node_curves.get(&e.0).unwrap_or(&none), node_curves.get(&e.1).unwrap_or(&none));
+                if !oc.iter().any(|c| !ct.contains(c) && !c0.contains(c) && !c1.contains(c)) {
+                    continue;
+                }
+                let (a, b, o) = (self.nodes[e.0 as usize], self.nodes[e.1 as usize], self.nodes[apex as usize]);
+                let ab = sub(b, a);
+                let len = norm(ab);
+                let w = norm(cross(ab, sub(o, a))) / len;
+                if w > 0.0 && len > ratio * w {
+                    let s = cand.entry(e).or_insert(0.0);
+                    *s = s.max(len / (ratio * w));
+                }
+            }
+        }
+        let mut order: Vec<(f64, Edge)> = cand.into_iter().map(|(e, s)| (s, e)).collect();
+        order.sort_by(|x, y| y.0.total_cmp(&x.0).then(x.1.cmp(&y.1)));
+        order
+    }
+
     /// Greedily refine the highest-error tets until the target count is reached.
     pub fn run(&mut self) {
         let target = ((1.0 + self.params.growth) * self.n_alive as f64).round() as usize;
@@ -680,6 +765,92 @@ mod tests {
                 assert!((q[0] - p[0] - n as f64).abs() < 1e-12 && (q[1] - p[1]).abs() < 1e-12 && (q[2] - p[2]).abs() < 1e-12);
             }
         }
+    }
+
+    #[test]
+    fn narrow_strip_is_regularised() {
+        // 10 x 0.2 x 1 slab, one cell per unit length: the top face is a narrow
+        // strip with 1.0-long curve edges along a 0.2-wide strip (ratio 5).
+        let (nx, w) = (10u32, 0.2);
+        let id = |i: u32, j: u32, k: u32| i + (nx + 1) * (j + 2 * k);
+        let mut nodes = vec![];
+        for k in 0..2 {
+            for j in 0..2 {
+                for i in 0..=nx {
+                    nodes.push([i as f64, j as f64 * w, k as f64]);
+                }
+            }
+        }
+        let mut tets = vec![];
+        for i in 0..nx {
+            let c = |b: u32| id(i + (b & 1), (b >> 1) & 1, (b >> 2) & 1);
+            for p in [[1, 2, 4], [1, 4, 2], [2, 1, 4], [2, 4, 1], [4, 1, 2], [4, 2, 1]] {
+                let t = [c(0), c(p[0]), c(p[0] + p[1]), c(7)];
+                let x = t.map(|v| nodes[v as usize]);
+                tets.push(if vol6(x[0], x[1], x[2], x[3]) < 0.0 { [t[0], t[1], t[3], t[2]] } else { t });
+            }
+        }
+        // Top face (the strip) is tag 1; all other boundary faces get tag 2 so
+        // that, as in EMerge, every boundary node is on a tagged face.
+        let top: Vec<(Face, i32)> = boundary_faces(&tets)
+            .into_iter()
+            .filter(|(_, c)| *c == 1)
+            .map(|(f, _)| (f, if f.iter().all(|&v| nodes[v as usize][2] == 1.0) { 1 } else { 2 }))
+            .collect();
+        let mut curves = vec![];
+        for i in 0..nx {
+            curves.push(((id(i, 0, 1), id(i + 1, 0, 1)), 10)); // long side y=0
+            curves.push(((id(i, 1, 1), id(i + 1, 1, 1)), 11)); // long side y=w
+        }
+        curves.push(((id(0, 0, 1), id(0, 1, 1)), 12));
+        curves.push(((id(nx, 0, 1), id(nx, 1, 1)), 13));
+        let tri_q = |n: &[P3], f: &Face| {
+            let x = f.map(|v| n[v as usize]);
+            let a = norm(cross(sub(x[1], x[0]), sub(x[2], x[0]))) / 2.0;
+            let l2: f64 = [(0, 1), (1, 2), (0, 2)].iter().map(|&(i, j)| dot(sub(x[i], x[j]), sub(x[i], x[j]))).sum();
+            4.0 * 3f64.sqrt() * a / l2
+        };
+        let q0 = top.iter().filter(|x| x.1 == 1).map(|(f, _)| tri_q(&nodes, f)).fold(f64::INFINITY, f64::min);
+        let n0 = tets.len();
+        let brep = Brep::default();
+        let err = vec![0.0; n0];
+        let mut r = Refiner::new(nodes, tets, err, &top, &curves, &brep, Params { growth: 0.0, ..Default::default() });
+        let ratio = 2.0;
+        let splits = r.regularize_strips(ratio, 100 * n0);
+        let out = r.finish();
+        assert!(splits > 0);
+        // Long-side curve edges are now at most ratio * w.
+        for (e, tag) in out.curve_edges.iter().zip(&out.curve_edge_tags) {
+            if *tag == 10 || *tag == 11 {
+                let l = norm(sub(out.nodes[e.0 as usize], out.nodes[e.1 as usize]));
+                assert!(l <= ratio * w + 1e-12, "curve edge {l} longer than {}", ratio * w);
+            }
+        }
+        // Surface flips remove the long diagonals left inside the strip.
+        let mut out = out;
+        let faces: Vec<(Face, i32)> = out.face_tris.iter().copied().zip(out.face_tri_tags.iter().copied()).collect();
+        let curve_set: std::collections::HashSet<Edge> = out.curve_edges.iter().copied().collect();
+        let m = out.tets.len();
+        let tets = std::mem::take(&mut out.tets);
+        let mut imp = crate::improve::Improver::new(
+            &mut out.nodes, tets, vec![0; m], vec![0; m], vec![true; m], &faces, &curve_set,
+            crate::improve::ImproveParams { sweeps: 6, ..Default::default() },
+        );
+        imp.set_planar_tags(&[1].into_iter().collect());
+        imp.run();
+        assert!(imp.stats.n_surface_flips > 0, "{:?}", imp.stats);
+        let (tets, _, _, _, faces) = imp.finish();
+        out.tets = tets;
+        out.face_tris = faces.iter().filter(|x| x.1 == 1).map(|x| x.0).collect();
+        let q1 = out.face_tris.iter().map(|f| tri_q(&out.nodes, f)).fold(f64::INFINITY, f64::min);
+        assert!(q1 > 2.0 * q0, "strip triangle quality {q0} -> {q1}");
+        let vol: f64 = out.tets.iter().map(|t| {
+            let x = t.map(|v| out.nodes[v as usize]);
+            let v = vol6(x[0], x[1], x[2], x[3]);
+            assert!(v > 0.0);
+            v / 6.0
+        }).sum();
+        assert!((vol - nx as f64 * w).abs() < 1e-12);
     }
 
     #[test]

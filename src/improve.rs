@@ -5,6 +5,10 @@
 //! * Edge removal (3-2, 4-4, 5-6, 6-8, 7-10): the tets around an edge with 3..=7
 //!   tets are re-triangulated without that edge, trying every triangulation of
 //!   the ring of nodes around it.
+//! * Surface flip: the diagonal between two triangles of the same planar
+//!   geometric face is swapped, re-triangulating the tets on either side of the
+//!   surface (one side for an outer boundary, two for a sheet or interface).
+//!   This repairs slivers on the surface itself, e.g. along narrow strips.
 //! * Smoothing: a free node moves (partially) towards the centroid of its
 //!   neighbours if that improves the worst incident tet. Nodes on a single
 //!   planar geometric face (not on a curve) may slide within that plane.
@@ -51,11 +55,13 @@ pub struct ImproveParams {
     pub smooth_iters: usize,
     /// Rings of node-adjacent neighbours around the new tets added to the work zone.
     pub layers: usize,
+    /// Work on the whole mesh instead of the refined region only.
+    pub global: bool,
 }
 
 impl Default for ImproveParams {
     fn default() -> Self {
-        ImproveParams { sweeps: 3, flip_quality: 0.6, smooth_iters: 2, layers: 2 }
+        ImproveParams { sweeps: 3, flip_quality: 0.6, smooth_iters: 2, layers: 2, global: false }
     }
 }
 
@@ -69,6 +75,8 @@ pub struct ImproveStats {
     pub n_smoothed: usize,
     /// Smoothing moves of nodes sliding within a planar face.
     pub n_slid: usize,
+    /// Diagonal swaps on planar geometric faces.
+    pub n_surface_flips: usize,
     /// Number of tets in the work zone (new tets plus halo) at the start.
     pub n_zone: usize,
 }
@@ -83,7 +91,13 @@ pub struct Improver<'a> {
     zone: Vec<bool>,
     alive: Vec<bool>,
     shell: HashMap<Edge, Vec<u32>>,
-    fixed_faces: &'a HashSet<Face>,
+    /// Tagged face triangles and their tags (changed only by surface flips).
+    faces: HashMap<Face, Vec<i32>>,
+    curve_edges: HashSet<Edge>,
+    /// Tags of planar faces (surface flips and sliding are allowed there).
+    planar: HashSet<i32>,
+    /// Nodes that must never move or be part of a surface flip (periodic faces).
+    locked: HashSet<u32>,
     fixed_edges: HashSet<Edge>,
     fixed_nodes: HashSet<u32>,
     /// Nodes on tagged curves (never move).
@@ -104,10 +118,17 @@ impl<'a> Improver<'a> {
         region: Vec<i32>,
         root: Vec<u32>,
         active: Vec<bool>,
-        fixed_faces: &'a HashSet<Face>,
+        face_list: &[(Face, i32)],
         curve_edges: &HashSet<Edge>,
         params: ImproveParams,
     ) -> Self {
+        let mut faces: HashMap<Face, Vec<i32>> = HashMap::new();
+        for (f, tag) in face_list {
+            let v = faces.entry(fkey(f[0], f[1], f[2])).or_default();
+            if !v.contains(tag) {
+                v.push(*tag);
+            }
+        }
         let mut shell: HashMap<Edge, Vec<u32>> = HashMap::with_capacity(tets.len() * 2);
         let mut npos = 0usize;
         for (it, t) in tets.iter().enumerate() {
@@ -122,7 +143,7 @@ impl<'a> Improver<'a> {
         let sign = if 2 * npos >= tets.len() { 1.0 } else { -1.0 };
         let mut fixed_edges: HashSet<Edge> = curve_edges.clone();
         let mut fixed_nodes: HashSet<u32> = HashSet::new();
-        for f in fixed_faces {
+        for f in faces.keys() {
             fixed_edges.insert(ekey(f[0], f[1]));
             fixed_edges.insert(ekey(f[1], f[2]));
             fixed_edges.insert(ekey(f[0], f[2]));
@@ -140,7 +161,10 @@ impl<'a> Improver<'a> {
             active,
             alive: vec![true; n],
             shell,
-            fixed_faces,
+            faces,
+            curve_edges: curve_edges.clone(),
+            planar: HashSet::new(),
+            locked: HashSet::new(),
             fixed_edges,
             fixed_nodes,
             curve_nodes,
@@ -151,25 +175,33 @@ impl<'a> Improver<'a> {
         }
     }
 
-    /// Allow nodes that lie on exactly one tagged face, which is planar, and on no
-    /// tagged curve to slide within that plane during smoothing.
-    pub fn set_planar_faces(&mut self, face_tris: &[(Face, i32)], planar_tags: &HashSet<i32>) {
+    /// Declare which face tags are planar. On those faces nodes may slide within
+    /// the plane (if they lie on exactly one tagged face and on no curve) and
+    /// diagonals may be swapped by surface flips.
+    pub fn set_planar_tags(&mut self, planar_tags: &HashSet<i32>) {
+        self.planar = planar_tags.clone();
+        self.rebuild_slide();
+    }
+
+    fn rebuild_slide(&mut self) {
         let mut node_tags: HashMap<u32, Vec<i32>> = HashMap::new();
-        for (f, tag) in face_tris {
+        for (f, tags) in &self.faces {
             for &v in f {
                 let e = node_tags.entry(v).or_default();
-                if !e.contains(tag) {
-                    e.push(*tag);
+                for t in tags {
+                    if !e.contains(t) {
+                        e.push(*t);
+                    }
                 }
             }
         }
         self.slide.clear();
-        for (f, tag) in face_tris {
-            if !planar_tags.contains(tag) {
+        for (f, tags) in &self.faces {
+            if tags.len() != 1 || !self.planar.contains(&tags[0]) {
                 continue;
             }
             for &v in f {
-                if self.curve_nodes.contains(&v) || node_tags[&v].len() != 1 {
+                if self.curve_nodes.contains(&v) || self.locked.contains(&v) || node_tags[&v].len() != 1 {
                     continue;
                 }
                 let x = f.map(|i| self.nodes[i as usize]);
@@ -194,6 +226,7 @@ impl<'a> Improver<'a> {
         for v in nodes {
             self.slide.remove(v);
             self.fixed_nodes.insert(*v);
+            self.locked.insert(*v);
         }
     }
 
@@ -230,6 +263,17 @@ impl<'a> Improver<'a> {
     /// the old ones (no overlap/inversion) and improve the minimum quality.
     /// Returns the oriented new tets if accepted.
     fn evaluate(&self, old: &[u32], new: &[[u32; 4]]) -> Option<(Vec<[u32; 4]>, f64)> {
+        let (out, q_new, q_old) = self.valid(old, new)?;
+        if q_new > q_old + 1e-6 {
+            Some((out, q_new))
+        } else {
+            None
+        }
+    }
+
+    /// Validity only: the new tets exactly tile the old ones. Returns the oriented
+    /// new tets with the new and old minimum quality.
+    fn valid(&self, old: &[u32], new: &[[u32; 4]]) -> Option<(Vec<[u32; 4]>, f64, f64)> {
         let v_old: f64 = old.iter().map(|&i| self.signed_vol(self.tets[i as usize]).abs()).sum();
         let q_old = old.iter().map(|&i| self.q(self.tets[i as usize])).fold(f64::INFINITY, f64::min);
         let mut v_new = 0.0;
@@ -246,10 +290,18 @@ impl<'a> Improver<'a> {
             return None;
         }
         let q_new = out.iter().map(|t| self.q(*t)).fold(f64::INFINITY, f64::min);
-        if q_new > q_old + 1e-6 {
-            Some((out, q_new))
+        Some((out, q_new, q_old))
+    }
+
+    /// Shape quality of a triangle: 1 for equilateral, 0 for degenerate.
+    fn tri_quality(&self, f: Face) -> f64 {
+        let x = f.map(|i| self.nodes[i as usize]);
+        let a = norm(cross(sub(x[1], x[0]), sub(x[2], x[0]))) / 2.0;
+        let l2: f64 = [(0, 1), (1, 2), (0, 2)].iter().map(|&(i, j)| dot(sub(x[i], x[j]), sub(x[i], x[j]))).sum();
+        if l2 == 0.0 {
+            0.0
         } else {
-            None
+            4.0 * 3f64.sqrt() * a / l2
         }
     }
 
@@ -319,7 +371,7 @@ impl<'a> Improver<'a> {
         let [i, j, k] = TET_FACES[local_face];
         let (a, b, c) = (t[i], t[j], t[k]);
         let f = fkey(a, b, c);
-        if self.fixed_faces.contains(&f) {
+        if self.faces.contains_key(&f) {
             return false;
         }
         let nb: Vec<u32> = self.face_tets(f).into_iter().filter(|&u| u != it).collect();
@@ -460,11 +512,180 @@ impl<'a> Improver<'a> {
         n
     }
 
+    /// Swap the diagonal `e` between two triangles of the same planar face.
+    fn try_surface_flip(&mut self, e: Edge) -> bool {
+        let (a, b) = e;
+        if self.curve_edges.contains(&e) || self.locked.contains(&a) || self.locked.contains(&b) {
+            return false;
+        }
+        let Some(shell) = self.shell.get(&e).cloned() else { return false };
+        let mut tris: Vec<(u32, Face)> = vec![];
+        for &it in &shell {
+            for &o in self.tets[it as usize].iter() {
+                if o != a && o != b {
+                    let f = fkey(a, b, o);
+                    if self.faces.contains_key(&f) && !tris.iter().any(|(_, g)| *g == f) {
+                        tris.push((o, f));
+                    }
+                }
+            }
+        }
+        if tris.len() != 2 {
+            return false;
+        }
+        let ((c, fc), (d, fd)) = (tris[0], tris[1]);
+        let tags = self.faces[&fc].clone();
+        if tags.len() != 1 || self.faces[&fd] != tags || !self.planar.contains(&tags[0]) {
+            return false;
+        }
+        if self.locked.contains(&c) || self.locked.contains(&d) || self.shell.contains_key(&ekey(c, d)) {
+            return false;
+        }
+        // The quad a-c-b-d must be convex: c, d on opposite sides of ab and a, b
+        // on opposite sides of cd.
+        let p = |i: u32| self.nodes[i as usize];
+        let n = cross(sub(p(b), p(a)), sub(p(c), p(a)));
+        let side = |u: u32, v: u32, w: u32| dot(cross(sub(p(v), p(u)), sub(p(w), p(u))), n);
+        if side(a, b, c) * side(a, b, d) >= 0.0 || side(c, d, a) * side(c, d, b) >= 0.0 {
+            return false;
+        }
+        let q2_old = self.tri_quality(fc).min(self.tri_quality(fd));
+        let q2_new = self.tri_quality(fkey(a, c, d)).min(self.tri_quality(fkey(b, c, d)));
+        if q2_new <= q2_old + 1e-6 {
+            return false;
+        }
+
+        // The shell splits into one chain of tets from c to d per side of the surface.
+        let pairs: Vec<(u32, u32, u32)> = shell
+            .iter()
+            .map(|&it| {
+                let o: Vec<u32> = self.tets[it as usize].iter().copied().filter(|&x| x != a && x != b).collect();
+                (o[0], o[1], it)
+            })
+            .collect();
+        let mut used = vec![false; pairs.len()];
+        let mut chains: Vec<(Vec<u32>, Vec<u32>)> = vec![];
+        while used.iter().any(|u| !u) {
+            let (mut ring, mut ctets, mut cur) = (vec![c], vec![], c);
+            loop {
+                let Some(k) = (0..pairs.len()).find(|&k| !used[k] && (pairs[k].0 == cur || pairs[k].1 == cur)) else {
+                    return false;
+                };
+                used[k] = true;
+                cur = if pairs[k].0 == cur { pairs[k].1 } else { pairs[k].0 };
+                ctets.push(pairs[k].2);
+                ring.push(cur);
+                if cur == d {
+                    break;
+                }
+                if ring.len() > 7 {
+                    return false;
+                }
+            }
+            chains.push((ring, ctets));
+            if chains.len() > 2 {
+                return false;
+            }
+        }
+
+        // Re-triangulate each side without edge ab; the closing chord d-c becomes
+        // the new surface edge.
+        let mut plan: Vec<(Vec<u32>, Vec<[u32; 4]>)> = vec![];
+        let (mut q3_old, mut q3_new) = (f64::INFINITY, f64::INFINITY);
+        for (r, ctets) in &chains {
+            let nr = r.len();
+            if nr < 3 || !self.same_region(ctets) {
+                return false;
+            }
+            let mut best: Option<(Vec<[u32; 4]>, f64, f64)> = None;
+            'tri: for tris in polygon_triangulations(nr) {
+                let mut new = Vec::with_capacity(2 * tris.len());
+                for &[i, j, k] in &tris {
+                    for (x, y) in [(i, j), (j, k), (i, k)] {
+                        let polygon_edge = x.abs_diff(y) == 1 || x.abs_diff(y) == nr - 1;
+                        if !polygon_edge && self.shell.contains_key(&ekey(r[x], r[y])) {
+                            continue 'tri;
+                        }
+                    }
+                    if !self.face_tets(fkey(r[i], r[j], r[k])).is_empty() {
+                        continue 'tri;
+                    }
+                    new.push([r[i], r[j], r[k], a]);
+                    new.push([r[i], r[j], r[k], b]);
+                }
+                if let Some((out, qn, qo)) = self.valid(ctets, &new) {
+                    if best.as_ref().map_or(true, |(_, qb, _)| qn > *qb) {
+                        best = Some((out, qn, qo));
+                    }
+                }
+            }
+            let Some((out, qn, qo)) = best else { return false };
+            q3_new = q3_new.min(qn);
+            q3_old = q3_old.min(qo);
+            plan.push((ctets.clone(), out));
+        }
+        // Accept if the surface improves without making the volume noticeably worse.
+        if q3_new < 0.8 * q3_old {
+            return false;
+        }
+        for (old, new) in plan {
+            self.replace(&old, new);
+        }
+        self.faces.remove(&fc);
+        self.faces.remove(&fd);
+        self.faces.insert(fkey(a, c, d), tags.clone());
+        self.faces.insert(fkey(b, c, d), tags);
+        self.fixed_edges.remove(&e);
+        self.fixed_edges.insert(ekey(c, d));
+        self.stats.n_surface_flips += 1;
+        true
+    }
+
+    fn surface_sweep(&mut self) -> usize {
+        if self.planar.is_empty() {
+            return 0;
+        }
+        let mut zone_nodes: HashSet<u32> = HashSet::new();
+        for i in 0..self.tets.len() {
+            if self.alive[i] && self.zone[i] {
+                zone_nodes.extend(self.tets[i]);
+            }
+        }
+        let mut cand: Vec<(f64, Face)> = self
+            .faces
+            .iter()
+            .filter(|(f, tags)| tags.len() == 1 && self.planar.contains(&tags[0]) && f.iter().all(|v| zone_nodes.contains(v)))
+            .map(|(f, _)| (self.tri_quality(*f), *f))
+            .filter(|(q, _)| *q < self.params.flip_quality)
+            .collect();
+        cand.sort_by(|x, y| x.0.total_cmp(&y.0).then(x.1.cmp(&y.1)));
+        let mut n = 0;
+        for (_, f) in cand {
+            if !self.faces.contains_key(&f) {
+                continue;
+            }
+            // Try the longest edge first: that is the diagonal a sliver wants gone.
+            let mut edges: Vec<Edge> = (0..3).map(|k| ekey(f[k], f[(k + 1) % 3])).collect();
+            edges.sort_by(|x, y| {
+                let l = |e: &Edge| dot(sub(self.nodes[e.0 as usize], self.nodes[e.1 as usize]), sub(self.nodes[e.0 as usize], self.nodes[e.1 as usize]));
+                l(y).total_cmp(&l(x))
+            });
+            for e in edges {
+                if self.try_surface_flip(e) {
+                    n += 1;
+                    break;
+                }
+            }
+        }
+        n
+    }
+
     // ------------------------------------------------------------------
     // Smoothing
     // ------------------------------------------------------------------
 
     fn smooth_sweep(&mut self) -> usize {
+        self.rebuild_slide();
         let mut node_tets: HashMap<u32, Vec<u32>> = HashMap::new();
         for (i, t) in self.tets.iter().enumerate() {
             if !self.alive[i] {
@@ -540,6 +761,11 @@ impl<'a> Improver<'a> {
 
     /// Grow the work zone by `layers` rings of node-adjacent tets.
     fn expand_zone(&mut self) {
+        if self.params.global {
+            self.zone.iter_mut().for_each(|z| *z = true);
+            self.stats.n_zone = self.alive.iter().filter(|&&a| a).count();
+            return;
+        }
         let n_nodes = self.nodes.len();
         for _ in 0..self.params.layers {
             let mut hot = vec![false; n_nodes];
@@ -562,7 +788,7 @@ impl<'a> Improver<'a> {
     pub fn run(&mut self) {
         self.expand_zone();
         for _ in 0..self.params.sweeps {
-            let flips = self.flip_sweep();
+            let flips = self.flip_sweep() + self.surface_sweep();
             let mut moved = 0;
             for _ in 0..self.params.smooth_iters {
                 moved += self.smooth_sweep();
@@ -574,8 +800,9 @@ impl<'a> Improver<'a> {
         }
     }
 
-    /// Compact the alive tets: returns (tets, region, root, active).
-    pub fn finish(self) -> (Vec<[u32; 4]>, Vec<i32>, Vec<u32>, Vec<bool>) {
+    /// Compact the alive tets: returns (tets, region, root, active, tagged faces).
+    #[allow(clippy::type_complexity)]
+    pub fn finish(self) -> (Vec<[u32; 4]>, Vec<i32>, Vec<u32>, Vec<bool>, Vec<(Face, i32)>) {
         let mut t = vec![];
         let mut r = vec![];
         let mut o = vec![];
@@ -588,7 +815,10 @@ impl<'a> Improver<'a> {
                 a.push(self.active[i]);
             }
         }
-        (t, r, o, a)
+        let mut faces: Vec<(Face, i32)> =
+            self.faces.iter().flat_map(|(f, tags)| tags.iter().map(move |t| (*f, *t))).collect();
+        faces.sort_unstable();
+        (t, r, o, a, faces)
     }
 }
 
@@ -701,9 +931,10 @@ mod tests {
         let mut nodes = nodes;
         let before = nodes.clone();
         let m = tets.len();
-        let mut imp = Improver::new(&mut nodes, tets, vec![0; m], vec![0; m], vec![true; m], &fixed, &curves,
+        let _ = &fixed;
+        let mut imp = Improver::new(&mut nodes, tets, vec![0; m], vec![0; m], vec![true; m], &bnd, &curves,
                                     ImproveParams::default());
-        imp.set_planar_faces(&bnd, &planar);
+        imp.set_planar_tags(&planar);
         imp.run();
         assert!(imp.stats.n_slid > 0, "{:?}", imp.stats);
         let (tets, ..) = imp.finish();
@@ -765,12 +996,13 @@ mod tests {
         let (q0, m0) = (qmin(&out.nodes, &out.tets), qmean(&out.nodes, &out.tets));
 
         let fixed: HashSet<Face> = out.face_tris.iter().copied().collect();
+        let bnd_tagged: Vec<(Face, i32)> = out.face_tris.iter().copied().zip(out.face_tri_tags.iter().copied()).collect();
         let region = vec![0; out.tets.len()];
         let tets = std::mem::take(&mut out.tets);
         let active = vec![true; tets.len()];
         let root = out.tet_root.clone();
         let mut imp =
-            Improver::new(&mut out.nodes, tets, region, root, active, &fixed, &HashSet::new(), ImproveParams::default());
+            Improver::new(&mut out.nodes, tets, region, root, active, &bnd_tagged, &HashSet::new(), ImproveParams::default());
         imp.run();
         let stats = imp.stats.clone();
         let (tets, ..) = imp.finish();

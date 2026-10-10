@@ -11,13 +11,15 @@
 
 EMerge's default adaptive mesh refinement (AMR) regenerates the whole mesh with GMSH on every pass, using a size field derived from the error estimate. AURA instead **refines the existing mesh locally**:
 
+0. **Step 0 (once, before the first solve):** narrow strips such as thin PCB traces are detected purely from the geometry tags. The curve edges along each strip are split until they are at most `strip_ratio` (default 4) strip widths long, and the whole mesh gets one quality pass. Without this, every triangle across a narrow strip is a sliver, whatever the triangulation.
 1. The tetrahedra with the highest error are bisected through their longest edge, one at a time, until the mesh has `(1 + growth)` times as many tets. Every split is *conforming*: all tets around the split edge are bisected together, so there are never hanging nodes.
 2. New nodes on curved faces and curves (spheres, cylinders, circles, B-splines, …) are projected onto a one-time snapshot of the original OCC geometry, so the mesh converges to the real geometry rather than the initial facets.
 3. The new tets, plus a few layers of neighbouring old tets where new and old elements meet, are improved by flips and smoothing:
    - 2-3 flips,
    - edge removal for edges with 3 to 7 tets around them,
    - smoothing of interior nodes,
-   - in-plane sliding of nodes on planar geometric faces.
+   - in-plane sliding of nodes on planar geometric faces,
+   - surface flips (swapping the diagonal between two triangles of the same planar face).
 
    A change is only accepted if it improves the worst tet it touches. Curve nodes never move, and face nodes never leave their plane.
 4. Periodic boundaries are supported. An edge on a periodic face is always split together with all of its periodic images, so paired faces stay exact translated copies. Node numbering stays consistent across each pair, which EMerge needs for consistent edge orientations.
@@ -65,7 +67,7 @@ AURA-specific arguments:
 | `growth` | `0.3` | Tet growth per pass: a float, a per-pass list such as `[1.0, 0.6, 0.3]`, `"auto"` (predicted from the error estimate using `theta`/`order`), or a callable `f(step, info) -> float` |
 | `growth_limits` | `(0.1, 1.0)` | Clamp on the growth of every pass |
 | `use_aura` | `True` | Set to `False` to force the original GMSH remeshing AMR |
-| `aura_options` | `None` | Dict with `max_depth`, `lepp_ratio`, `improve_sweeps`, `improve_layers`, `project_boundaries` |
+| `aura_options` | `None` | Dict with `max_depth`, `lepp_ratio`, `improve_sweeps`, `improve_layers`, `improve_initial`, `improve_global`, `strip_ratio`, `strip_max_growth`, `project_boundaries` |
 
 For a callable `growth`, `info` contains `n_tets`, `error` (per-tet error indicator), `convergence` (the last max |ΔS|, or `None`) and `auto` (the value `"auto"` would have used). For example:
 
@@ -134,6 +136,7 @@ The workflow checks that the tag matches `Cargo.toml`, builds and smoke-tests al
 - Refinement only: the mesh is never coarsened.
 - Quality improvement only covers the refined region plus `improve_layers` rings of neighbours.
 - Flat tets in thin layers (e.g. a substrate meshed one element thick) cannot be fixed without refining the whole layer, so they stay as they are.
+- Step 0 does not grade the faces next to a refined strip. Very small `strip_ratio` values (around 2) therefore create fan-shaped slivers beside the strip; the default of 4 avoids this.
 - The number of tets per pass slightly overshoots the target when the last split has a large shell.
 
 ## License

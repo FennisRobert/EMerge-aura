@@ -117,7 +117,8 @@ mod py {
         surf_tags, surf_kind, surf_params, samp_owner, samp_pts, samp_nrm,
         curve_tags, curve_kind, curve_params, poly_owner, poly_pts,
         growth, child_factor, max_depth, min_projected_volume, lepp_ratio,
-        improve_sweeps, flip_quality, smooth_iters, improve_layers
+        improve_sweeps, flip_quality, smooth_iters, improve_layers, improve_global,
+        strip_ratio, strip_max_growth
     ))]
     fn refine<'py>(
         py: Python<'py>,
@@ -150,9 +151,13 @@ mod py {
         flip_quality: f64,
         smooth_iters: usize,
         improve_layers: usize,
+        improve_global: bool,
+        strip_ratio: f64,
+        strip_max_growth: f64,
     ) -> PyResult<Bound<'py, PyDict>> {
         let nodes = rows3(&nodes)?;
         let tets = rows_u32::<4>(&tets)?;
+        let tets_len = tets.len();
         let error = error.as_slice()?.to_vec();
         if error.len() != tets.len() {
             return Err(PyValueError::new_err("error must have one value per tetrahedron"));
@@ -195,11 +200,21 @@ mod py {
             .map(|r| (r[0] as usize, r[1], r[2]))
             .collect();
         let iparams =
-            ImproveParams { sweeps: improve_sweeps, flip_quality, smooth_iters, layers: improve_layers };
+            ImproveParams {
+            sweeps: improve_sweeps,
+            flip_quality,
+            smooth_iters,
+            layers: improve_layers,
+            global: improve_global,
+        };
 
         let (mut out, region, istats) = py.allow_threads(|| {
             let mut r = Refiner::new(nodes, tets, error, &faces, &curves, &brep, params);
             r.set_periodic(&pairs);
+            if strip_ratio > 0.0 {
+                let n = tets_len as f64;
+                r.regularize_strips(strip_ratio, (n * (1.0 + strip_max_growth)).round() as usize);
+            }
             r.run();
             let periodic_nodes = r.periodic_nodes();
             let mut out = r.finish();
@@ -207,7 +222,6 @@ mod py {
             if iparams.sweeps == 0 {
                 return (out, region, Default::default());
             }
-            let fixed_faces: HashSet<[u32; 3]> = out.face_tris.iter().copied().collect();
             let curve_set: HashSet<(u32, u32)> = out.curve_edges.iter().copied().collect();
             let tets = std::mem::take(&mut out.tets);
             let root = std::mem::take(&mut out.tet_root);
@@ -221,16 +235,18 @@ mod py {
                 .map(|(t, _)| *t)
                 .collect();
             let mut imp = Improver::new(
-                &mut out.nodes, tets, region, root, active, &fixed_faces, &curve_set, iparams,
+                &mut out.nodes, tets, region, root, active, &face_list, &curve_set, iparams,
             );
-            imp.set_planar_faces(&face_list, &planar);
             imp.lock_nodes(&periodic_nodes);
+            imp.set_planar_tags(&planar);
             imp.run();
             let istats = imp.stats.clone();
-            let (t, r, o, a) = imp.finish();
+            let (t, r, o, a, faces) = imp.finish();
             out.tets = t;
             out.tet_root = o;
             out.tet_new = a;
+            out.face_tris = faces.iter().map(|x| x.0).collect();
+            out.face_tri_tags = faces.iter().map(|x| x.1).collect();
             (out, r, istats)
         });
         let tet_new: Vec<bool> = std::mem::take(&mut out.tet_new);
@@ -266,6 +282,7 @@ mod py {
         s.set_item("n_projected", out.stats.n_projected)?;
         s.set_item("n_projection_reduced", out.stats.n_projection_reduced)?;
         s.set_item("n_projection_rejected", out.stats.n_projection_rejected)?;
+        s.set_item("n_strip_splits", out.stats.n_strip_splits)?;
         s.set_item("n_flip23", istats.n_flip23)?;
         s.set_item("n_flip32", istats.n_flip32)?;
         s.set_item("n_flip44", istats.n_flip44)?;
@@ -273,6 +290,7 @@ mod py {
         s.set_item("n_improve_zone", istats.n_zone)?;
         s.set_item("n_smoothed", istats.n_smoothed)?;
         s.set_item("n_slid", istats.n_slid)?;
+        s.set_item("n_surface_flips", istats.n_surface_flips)?;
         d.set_item("stats", s)?;
         Ok(d)
     }

@@ -400,6 +400,9 @@ def refine_mesh_step(
     lepp_ratio: float = 0.7,
     improve_sweeps: int = 3,
     improve_layers: int = 2,
+    improve_global: bool = False,
+    strip_ratio: float = 0.0,
+    strip_max_growth: float = 2.0,
     periodic: Periodic | None = None,
 ) -> tuple[Any, dict]:
     """Refine an EMerge ``Mesh3D`` once and return the new mesh plus a report.
@@ -409,7 +412,11 @@ def refine_mesh_step(
         error: (n_tets,) error indicator per tetrahedron.
         brep: Geometry snapshot for projecting new boundary nodes.
         growth: Relative increase of the number of tets (0.3 = +30 %).
-        order, max_depth, lepp_ratio, improve_sweeps, improve_layers: See :func:`emerge_aura.refine`.
+        order, max_depth, lepp_ratio, improve_sweeps, improve_layers, improve_global:
+            See :func:`emerge_aura.refine`. With ``growth=0`` and ``improve_global=True``
+            this is a pure quality-improvement pass over the whole mesh.
+        strip_ratio, strip_max_growth: Step 0 narrow-strip regularisation, see
+            :func:`emerge_aura.refine`.
         periodic: Periodic boundaries as ``[(face1_tags, face2_tags, dv), ...]``.
 
     Returns:
@@ -428,6 +435,9 @@ def refine_mesh_step(
         lepp_ratio=lepp_ratio,
         improve_sweeps=improve_sweeps,
         improve_layers=improve_layers,
+        improve_global=improve_global,
+        strip_ratio=strip_ratio,
+        strip_max_growth=strip_max_growth,
     )
     q_after = quality(result.nodes, result.tets)
     new = refine_mesh3d(mesh, result)
