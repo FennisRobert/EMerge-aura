@@ -117,7 +117,7 @@ mod py {
         surf_tags, surf_kind, surf_params, samp_owner, samp_pts, samp_nrm,
         curve_tags, curve_kind, curve_params, poly_owner, poly_pts,
         growth, child_factor, max_depth, min_projected_volume, lepp_ratio,
-        improve_sweeps, flip_quality, smooth_iters
+        improve_sweeps, flip_quality, smooth_iters, improve_layers
     ))]
     fn refine<'py>(
         py: Python<'py>,
@@ -148,6 +148,7 @@ mod py {
         improve_sweeps: usize,
         flip_quality: f64,
         smooth_iters: usize,
+        improve_layers: usize,
     ) -> PyResult<Bound<'py, PyDict>> {
         let nodes = rows3(&nodes)?;
         let tets = rows_u32::<4>(&tets)?;
@@ -180,9 +181,16 @@ mod py {
             poly_owner.as_slice()?,
             &rows3(&poly_pts)?,
         )?;
-        let params = Params { growth, child_factor, max_depth, min_projected_volume, lepp_ratio };
+        let params = Params {
+            growth,
+            child_factor,
+            max_depth,
+            min_projected_volume,
+            lepp_ratio,
+        };
 
-        let iparams = ImproveParams { sweeps: improve_sweeps, flip_quality, smooth_iters };
+        let iparams =
+            ImproveParams { sweeps: improve_sweeps, flip_quality, smooth_iters, layers: improve_layers };
 
         let (mut out, region, istats) = py.allow_threads(|| {
             let mut r = Refiner::new(nodes, tets, error, &faces, &curves, &brep, params);
@@ -197,9 +205,18 @@ mod py {
             let tets = std::mem::take(&mut out.tets);
             let root = std::mem::take(&mut out.tet_root);
             let active = std::mem::take(&mut out.tet_new);
+            let face_list: Vec<([u32; 3], i32)> =
+                out.face_tris.iter().copied().zip(out.face_tri_tags.iter().copied()).collect();
+            let planar: HashSet<i32> = brep
+                .surfaces
+                .iter()
+                .filter(|(_, srf)| matches!(srf, Surface::Flat))
+                .map(|(t, _)| *t)
+                .collect();
             let mut imp = Improver::new(
                 &mut out.nodes, tets, region, root, active, &fixed_faces, &curve_set, iparams,
             );
+            imp.set_planar_faces(&face_list, &planar);
             imp.run();
             let istats = imp.stats.clone();
             let (t, r, o, a) = imp.finish();
@@ -244,7 +261,10 @@ mod py {
         s.set_item("n_flip23", istats.n_flip23)?;
         s.set_item("n_flip32", istats.n_flip32)?;
         s.set_item("n_flip44", istats.n_flip44)?;
+        s.set_item("n_flip_large", istats.n_flip_large)?;
+        s.set_item("n_improve_zone", istats.n_zone)?;
         s.set_item("n_smoothed", istats.n_smoothed)?;
+        s.set_item("n_slid", istats.n_slid)?;
         d.set_item("stats", s)?;
         Ok(d)
     }

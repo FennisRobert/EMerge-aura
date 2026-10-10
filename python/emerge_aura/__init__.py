@@ -60,6 +60,7 @@ def refine(
     improve_sweeps: int = 3,
     flip_quality: float = 0.6,
     smooth_iters: int = 2,
+    improve_layers: int = 2,
 ) -> RefineResult:
     """Refine a tetrahedral mesh locally until it has ``(1 + growth)`` times as many tets.
 
@@ -69,7 +70,8 @@ def refine(
     a high-error tet can be bisected several times in one pass while refinement
     still spreads to the next-worst regions.
 
-    Afterwards the new tets are improved by 2-3, 3-2 and 4-4 flips and smart
+    Afterwards the new tets and ``improve_layers`` rings of neighbouring old tets
+    are improved by 2-3 flips, edge removal (3 to 7 tets around an edge) and smart
     Laplacian smoothing of free interior nodes. Each operation must strictly
     improve the worst tet it touches. Tagged faces, tagged curve edges, their
     nodes and region boundaries are never changed.
@@ -95,6 +97,8 @@ def refine(
         improve_sweeps: Number of flip + smoothing sweeps (0 disables improvement).
         flip_quality: Only tets with a mean ratio below this are flip candidates.
         smooth_iters: Smoothing iterations per sweep.
+        improve_layers: Rings of node-adjacent old tets around the refined region that
+            are improved as well (where new and old elements meet).
     """
     nodes = np.ascontiguousarray(nodes, dtype=np.float64)
     tets = np.ascontiguousarray(tets, dtype=np.int64)
@@ -128,6 +132,7 @@ def refine(
         int(improve_sweeps),
         float(flip_quality),
         int(smooth_iters),
+        int(improve_layers),
     )
     return RefineResult(**out)
 

@@ -13,7 +13,13 @@ EMerge's default adaptive mesh refinement (AMR) regenerates the whole mesh with 
 
 1. The tetrahedra with the highest error are bisected through their longest edge, one at a time, until the mesh has `(1 + growth)` times as many tets. Every split is *conforming*: all tets around the split edge are bisected together, so there are never hanging nodes.
 2. New nodes on curved faces and curves (spheres, cylinders, circles, B-splines, …) are projected onto a one-time snapshot of the original OCC geometry, so the mesh converges to the real geometry rather than the initial facets.
-3. The new tets are improved by 2-3, 3-2 and 4-4 flips and by smoothing interior nodes. A change is only accepted if it improves the worst tet it touches.
+3. The new tets, plus a few layers of neighbouring old tets where new and old elements meet, are improved by flips and smoothing:
+   - 2-3 flips,
+   - edge removal for edges with 3 to 7 tets around them,
+   - smoothing of interior nodes,
+   - in-plane sliding of nodes on planar geometric faces.
+
+   A change is only accepted if it improves the worst tet it touches. Curve nodes never move, and face nodes never leave their plane.
 4. Every geometric tag is inherited exactly: volumes, faces (boundary conditions!), curves and points. EMerge's `Mesh3D` is rebuilt from that, **without calling GMSH**.
 
 On the patch antenna test case it keeps the minimum element quality roughly constant over many passes. At the same tet count it gives more accurate S-parameters than the GMSH remeshing AMR.
@@ -52,7 +58,7 @@ AURA-specific arguments:
 | `growth` | `0.3` | Tet growth per pass: a float, a per-pass list such as `[1.0, 0.6, 0.3]`, `"auto"` (predicted from the error estimate using `theta`/`order`), or a callable `f(step, info) -> float` |
 | `growth_limits` | `(0.1, 1.0)` | Clamp on the growth of every pass |
 | `use_aura` | `True` | Set to `False` to force the original GMSH remeshing AMR |
-| `aura_options` | `None` | Dict with `max_depth`, `lepp_ratio`, `improve_sweeps`, `project_boundaries` |
+| `aura_options` | `None` | Dict with `max_depth`, `lepp_ratio`, `improve_sweeps`, `improve_layers`, `project_boundaries` |
 
 For a callable `growth`, `info` contains `n_tets`, `error` (per-tet error indicator), `convergence` (the last max |ΔS|, or `None`) and `auto` (the value `"auto"` would have used). For example:
 
@@ -87,7 +93,7 @@ The original nodes keep their indices, and new nodes are appended after them.
 
 ```
 src/refine.rs                      Longest-edge bisection with conforming edge splits and tag inheritance
-src/improve.rs                     Flips (2-3, 3-2, 4-4) and constrained smart Laplacian smoothing
+src/improve.rs                     Flips (2-3, edge removal 3..7) and constrained smoothing, incl. in-plane sliding
 src/geom.rs                        BREP snapshot primitives and point projection
 src/lib.rs                         PyO3 bindings
 python/emerge_aura/__init__.py     refine(), quality()
@@ -110,7 +116,8 @@ python test_cases/check_mesh_update.py           # Mesh3D consistency checks (re
 
 - Refinement only: the mesh is never coarsened.
 - No periodic boundary conditions yet.
-- Quality improvement only touches tets created in the current pass.
+- Quality improvement only covers the refined region plus `improve_layers` rings of neighbours.
+- Flat tets in thin layers (e.g. a substrate meshed one element thick) cannot be fixed without refining the whole layer, so they stay as they are.
 - The number of tets per pass slightly overshoots the target when the last split has a large shell.
 
 ## License

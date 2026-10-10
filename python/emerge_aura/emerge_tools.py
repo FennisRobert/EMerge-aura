@@ -316,6 +316,7 @@ def refine_mesh_step(
     max_depth: int = 6,
     lepp_ratio: float = 0.7,
     improve_sweeps: int = 3,
+    improve_layers: int = 2,
 ) -> tuple[Any, dict]:
     """Refine an EMerge ``Mesh3D`` once and return the new mesh plus a report.
 
@@ -324,7 +325,7 @@ def refine_mesh_step(
         error: (n_tets,) error indicator per tetrahedron.
         brep: Geometry snapshot for projecting new boundary nodes.
         growth: Relative increase of the number of tets (0.3 = +30 %).
-        order, max_depth, lepp_ratio, improve_sweeps: See :func:`emerge_aura.refine`.
+        order, max_depth, lepp_ratio, improve_sweeps, improve_layers: See :func:`emerge_aura.refine`.
 
     Returns:
         (new_mesh, report): the refined ``Mesh3D`` and a dict with ``n_tets_before``,
@@ -341,6 +342,7 @@ def refine_mesh_step(
         max_depth=max_depth,
         lepp_ratio=lepp_ratio,
         improve_sweeps=improve_sweeps,
+        improve_layers=improve_layers,
     )
     q_after = quality(result.nodes, result.tets)
     new = refine_mesh3d(mesh, result)
