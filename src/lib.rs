@@ -118,7 +118,7 @@ mod py {
         curve_tags, curve_kind, curve_params, poly_owner, poly_pts,
         growth, child_factor, max_depth, min_projected_volume, lepp_ratio,
         improve_sweeps, flip_quality, smooth_iters, improve_layers, improve_global,
-        strip_ratio, strip_max_growth
+        strip_ratio, strip_max_growth, strip_gated
     ))]
     fn refine<'py>(
         py: Python<'py>,
@@ -154,6 +154,7 @@ mod py {
         improve_global: bool,
         strip_ratio: f64,
         strip_max_growth: f64,
+        strip_gated: bool,
     ) -> PyResult<Bound<'py, PyDict>> {
         let nodes = rows3(&nodes)?;
         let tets = rows_u32::<4>(&tets)?;
@@ -211,11 +212,15 @@ mod py {
         let (mut out, region, istats) = py.allow_threads(|| {
             let mut r = Refiner::new(nodes, tets, error, &faces, &curves, &brep, params);
             r.set_periodic(&pairs);
-            if strip_ratio > 0.0 {
-                let n = tets_len as f64;
-                r.regularize_strips(strip_ratio, (n * (1.0 + strip_max_growth)).round() as usize);
+            let limit = |n: usize| (n as f64 * (1.0 + strip_max_growth)).round() as usize;
+            if strip_ratio > 0.0 && !strip_gated {
+                r.regularize_strips(strip_ratio, limit(tets_len));
             }
             r.run();
+            if strip_ratio > 0.0 && strip_gated {
+                let n = r.n_tets();
+                r.regularize_strips_gated(strip_ratio, limit(n));
+            }
             let periodic_nodes = r.periodic_nodes();
             let mut out = r.finish();
             let region: Vec<i32> = out.tet_root.iter().map(|&i| region_in[i as usize]).collect();

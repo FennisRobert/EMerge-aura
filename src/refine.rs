@@ -139,6 +139,12 @@ pub struct Refiner<'a> {
     n_alive: usize,
     heap: BinaryHeap<Prio>,
     n0: usize,
+    /// Lowest original error among the tets chosen by the error-driven refinement
+    /// of this pass (the "high error" cut-off used to gate strip regularisation).
+    refined_cutoff: f64,
+    /// When set, only strip edges next to a tet whose original error is at least
+    /// this value are regularised.
+    strip_gate: Option<f64>,
     /// Periodic node maps, one (forward, inverse) pair per periodic boundary.
     pmap: Vec<(HashMap<u32, u32>, HashMap<u32, u32>)>,
     pub stats: Stats,
@@ -208,6 +214,8 @@ impl<'a> Refiner<'a> {
             n_alive: n,
             heap,
             n0: n,
+            refined_cutoff: f64::INFINITY,
+            strip_gate: None,
             pmap: vec![],
 
             stats: Stats::default(),
@@ -607,6 +615,12 @@ impl<'a> Refiner<'a> {
                     }
                 }
                 let len = self.len2(e).sqrt();
+                if let Some(gate) = self.strip_gate {
+                    let hot = self.shell.get(&e).map_or(false, |sh| sh.iter().any(|&t| self.original_error(t) >= gate));
+                    if !hot {
+                        continue;
+                    }
+                }
                 if w.is_finite() && w > 0.0 && len > ratio * w {
                     let s = cand.entry(e).or_insert(0.0);
                     *s = s.max(len / (ratio * w));
@@ -626,8 +640,42 @@ impl<'a> Refiner<'a> {
             if !self.alive[it as usize] || self.depth[it as usize] >= self.params.max_depth {
                 continue;
             }
+            let e0 = self.original_error(it);
+            self.refined_cutoff = self.refined_cutoff.min(e0);
             self.refine_tet(it);
         }
+    }
+
+    /// Current number of tetrahedra.
+    pub fn n_tets(&self) -> usize {
+        self.n_alive
+    }
+
+    /// Error of the input tet that `it` descends from (children inherit it).
+    #[inline]
+    fn original_error(&self, it: u32) -> f64 {
+        let e = self.err[self.root[it as usize] as usize];
+        if e.is_finite() {
+            e
+        } else {
+            0.0
+        }
+    }
+
+    /// Error-gated strip regularisation, to be called after [`Refiner::run`].
+    ///
+    /// Like [`Refiner::regularize_strips`], but only narrow strips next to tets
+    /// whose original error reached the level of the tets the error-driven
+    /// refinement selected in this pass. Strips in quiet regions keep their mesh.
+    /// Returns the number of splits (0 if `run` refined nothing).
+    pub fn regularize_strips_gated(&mut self, ratio: f64, max_tets: usize) -> usize {
+        if !self.refined_cutoff.is_finite() {
+            return 0;
+        }
+        self.strip_gate = Some(self.refined_cutoff);
+        let n = self.regularize_strips(ratio, max_tets);
+        self.strip_gate = None;
+        n
     }
 
     pub fn finish(self) -> Output {
@@ -896,6 +944,72 @@ mod tests {
             v / 6.0
         }).sum();
         assert!((vol - nx as f64 * w).abs() < 1e-12);
+    }
+
+    #[test]
+    fn gated_strip_regularisation_stays_near_high_error() {
+        // Same 10 x 0.2 x 1 slab as above; the error is high only for x < 2.
+        let (nx, w) = (10u32, 0.2);
+        let id = |i: u32, j: u32, k: u32| i + (nx + 1) * (j + 2 * k);
+        let mut nodes = vec![];
+        for k in 0..2 {
+            for j in 0..2 {
+                for i in 0..=nx {
+                    nodes.push([i as f64, j as f64 * w, k as f64]);
+                }
+            }
+        }
+        let mut tets = vec![];
+        for i in 0..nx {
+            let c = |b: u32| id(i + (b & 1), (b >> 1) & 1, (b >> 2) & 1);
+            for p in [[1, 2, 4], [1, 4, 2], [2, 1, 4], [2, 4, 1], [4, 1, 2], [4, 2, 1]] {
+                let t = [c(0), c(p[0]), c(p[0] + p[1]), c(7)];
+                let x = t.map(|v| nodes[v as usize]);
+                tets.push(if vol6(x[0], x[1], x[2], x[3]) < 0.0 { [t[0], t[1], t[3], t[2]] } else { t });
+            }
+        }
+        let faces: Vec<(Face, i32)> = boundary_faces(&tets)
+            .into_iter()
+            .filter(|(_, c)| *c == 1)
+            .map(|(f, _)| (f, if f.iter().all(|&v| nodes[v as usize][2] == 1.0) { 1 } else { 2 }))
+            .collect();
+        let mut curves = vec![];
+        for i in 0..nx {
+            curves.push(((id(i, 0, 1), id(i + 1, 0, 1)), 10));
+            curves.push(((id(i, 1, 1), id(i + 1, 1, 1)), 11));
+        }
+        curves.push(((id(0, 0, 1), id(0, 1, 1)), 12));
+        curves.push(((id(nx, 0, 1), id(nx, 1, 1)), 13));
+        let err: Vec<f64> = tets
+            .iter()
+            .map(|t| {
+                let cx = t.iter().map(|&v| nodes[v as usize][0]).sum::<f64>() / 4.0;
+                if cx < 2.0 { 10.0 } else { 0.01 }
+            })
+            .collect();
+        let n0 = tets.len();
+        let brep = Brep::default();
+        let mut r = Refiner::new(nodes, tets, err, &faces, &curves, &brep, Params { growth: 0.2, ..Default::default() });
+        r.run();
+        let splits = r.regularize_strips_gated(2.0, 100 * n0);
+        let out = r.finish();
+        assert!(splits > 0);
+        let (mut near_max, mut far_min) = (0.0f64, f64::INFINITY);
+        for (e, tag) in out.curve_edges.iter().zip(&out.curve_edge_tags) {
+            if *tag != 10 && *tag != 11 {
+                continue;
+            }
+            let (a, b) = (out.nodes[e.0 as usize], out.nodes[e.1 as usize]);
+            let l = norm(sub(a, b));
+            let xm = 0.5 * (a[0] + b[0]);
+            if xm < 1.5 {
+                near_max = near_max.max(l);
+            } else if xm > 5.0 {
+                far_min = far_min.min(l);
+            }
+        }
+        assert!(near_max <= 0.4 + 1e-12, "strip near the high error was not regularised ({near_max})");
+        assert!(far_min >= 1.0 - 1e-12, "strip far from the high error was refined ({far_min})");
     }
 
     #[test]

@@ -403,6 +403,7 @@ def refine_mesh_step(
     improve_global: bool = False,
     strip_ratio: float = 0.0,
     strip_max_growth: float = 2.0,
+    strip_gated: bool = True,
     periodic: Periodic | None = None,
 ) -> tuple[Any, dict]:
     """Refine an EMerge ``Mesh3D`` once and return the new mesh plus a report.
@@ -415,7 +416,7 @@ def refine_mesh_step(
         order, max_depth, lepp_ratio, improve_sweeps, improve_layers, improve_global:
             See :func:`emerge_aura.refine`. With ``growth=0`` and ``improve_global=True``
             this is a pure quality-improvement pass over the whole mesh.
-        strip_ratio, strip_max_growth: Step 0 narrow-strip regularisation, see
+        strip_ratio, strip_max_growth, strip_gated: Narrow-strip regularisation, see
             :func:`emerge_aura.refine`.
         periodic: Periodic boundaries as ``[(face1_tags, face2_tags, dv), ...]``.
 
@@ -438,6 +439,7 @@ def refine_mesh_step(
         improve_global=improve_global,
         strip_ratio=strip_ratio,
         strip_max_growth=strip_max_growth,
+        strip_gated=strip_gated,
     )
     q_after = quality(result.nodes, result.tets)
     new = refine_mesh3d(mesh, result)

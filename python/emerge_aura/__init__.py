@@ -70,6 +70,7 @@ def refine(
     improve_global: bool = False,
     strip_ratio: float = 0.0,
     strip_max_growth: float = 2.0,
+    strip_gated: bool = True,
 ) -> RefineResult:
     """Refine a tetrahedral mesh locally until it has ``(1 + growth)`` times as many tets.
 
@@ -79,9 +80,12 @@ def refine(
     a high-error tet can be bisected several times in one pass while refinement
     still spreads to the next-worst regions.
 
-    With ``strip_ratio > 0`` a geometric step 0 runs first: curve edges along narrow
-    strips (e.g. thin PCB traces) are split until they are at most ``strip_ratio``
-    times the local strip width, so the triangles across the strip are not slivers.
+    With ``strip_ratio > 0`` curve edges along narrow strips (e.g. thin PCB traces)
+    are split until they are at most ``strip_ratio`` times the local strip width, so
+    the triangles across the strip are not slivers. With ``strip_gated`` (default)
+    this happens after the error-driven refinement and only for strips next to tets
+    whose error reached the level of the tets refined in this pass; otherwise it is a
+    purely geometric pass over all narrow strips, run first.
 
     Afterwards the new tets and ``improve_layers`` rings of neighbouring old tets
     are improved by 2-3 flips, edge removal (3 to 7 tets around an edge) and smart
@@ -118,7 +122,9 @@ def refine(
         improve_global: Improve the whole mesh instead of only the refined region.
         strip_ratio: Step 0 narrow-strip regularisation: maximum curve-edge length along
             a narrow strip relative to its width (e.g. 4). 0 disables it.
-        strip_max_growth: Step 0 stops once the tet count has grown by this fraction.
+        strip_max_growth: Strip regularisation stops once it has grown the tet count by
+            this fraction.
+        strip_gated: Only regularise strips in high-error regions (see above).
     """
     nodes = np.ascontiguousarray(nodes, dtype=np.float64)
     tets = np.ascontiguousarray(tets, dtype=np.int64)
@@ -159,6 +165,7 @@ def refine(
         bool(improve_global),
         float(strip_ratio),
         float(strip_max_growth),
+        bool(strip_gated),
     )
     return RefineResult(**out)
 
